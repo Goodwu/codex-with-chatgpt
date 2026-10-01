@@ -122,9 +122,10 @@ The C2C state directory lives outside the project (macOS:
 there, so each new chat looks like a health-check failure.
 
 `c2c setup`, `c2c doctor` and `c2c sandbox-allow` add that directory to
-`[sandbox_workspace_write].writable_roots` in `~/.codex/config.toml`
-(`%USERPROFILE%\.codex\config.toml` on Windows). After that, later chats
-do not need elevation.
+`[sandbox_workspace_write].writable_roots` in `<codex-home>/config.toml`, where
+`<codex-home>` is a non-empty `CODEX_HOME` when set, otherwise `~/.codex`
+(`%USERPROFILE%\.codex` on Windows). After that, later chats do not need
+elevation.
 
 ### Port already in use
 Handled automatically: an existing healthy bridge for the same workspace is
