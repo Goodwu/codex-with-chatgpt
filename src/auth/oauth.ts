@@ -1,4 +1,4 @@
-import { Router, type Request, type Response, urlencoded, json } from "express";
+import { Router, type Request, type Response, type RequestHandler, urlencoded, json } from "express";
 import { randomBytes } from "node:crypto";
 import { AuthStore, SUPPORTED_SCOPES, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
 import { PairingManager } from "../pairing/manager.js";
@@ -12,6 +12,8 @@ export interface OAuthDeps {
   workspaceName: string;
   getBaseUrl: (req: Request) => string;
   logger: Logger;
+  authorizationGuard?: RequestHandler;
+  authorizedRoots?: readonly string[];
 }
 
 interface PendingAuthRequest {
@@ -70,6 +72,7 @@ function pairingPage(opts: {
   workspaceName: string;
   scopes: string[];
   error?: string;
+  authorizedRoots?: readonly string[];
 }): string {
   const scopeLabels: Record<string, string> = {
     "workspace.read": "Read files in this workspace",
@@ -83,6 +86,9 @@ function pairingPage(opts: {
     .join("");
   const errorHtml = opts.error
     ? `<p class="error" role="alert">${escapeHtml(opts.error)}</p>`
+    : "";
+  const rootNotice = opts.authorizedRoots
+    ? `<p class="sub">Authorized directories: ${opts.authorizedRoots.map(escapeHtml).join(", ")}</p>`
     : "";
   const escapedProductName = escapeHtml(PRODUCT_NAME);
   const escapedWorkspaceName = escapeHtml(opts.workspaceName);
@@ -120,6 +126,7 @@ function pairingPage(opts: {
 <div class="card">
   <h1>${escapedProductName}</h1>
   <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (read-only):</p>
+  ${rootNotice}
   <ul>${scopeList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">
@@ -137,6 +144,7 @@ function pairingPage(opts: {
 export function createOAuthRouter(deps: OAuthDeps): Router {
   const router = Router();
   const pendingRequests = new Map<string, PendingAuthRequest>();
+  const guard: RequestHandler = deps.authorizationGuard ?? ((_req, _res, next) => next());
 
   const prunePending = (): void => {
     const now = Date.now();
@@ -161,7 +169,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
   // ---- Dynamic Client Registration (RFC 7591) ------------------------------
 
-  router.post("/oauth/register", json(), (req, res) => {
+  router.post("/oauth/register", json(), guard, (req, res) => {
     const body = req.body as { client_name?: string; redirect_uris?: unknown };
     const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
     if (
@@ -191,7 +199,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
   // ---- Authorization endpoint ----------------------------------------------
 
-  router.get("/oauth/authorize", (req, res) => {
+  router.get("/oauth/authorize", guard, (req, res) => {
     prunePending();
     const query = req.query as Record<string, string | undefined>;
     const client = query.client_id ? deps.store.getClient(query.client_id) : undefined;
@@ -237,10 +245,10 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     res
       .status(200)
       .type("html")
-      .send(pairingPage({ requestId: request.id, workspaceName: deps.workspaceName, scopes }));
+      .send(pairingPage({ requestId: request.id, workspaceName: deps.workspaceName, scopes, authorizedRoots: deps.authorizedRoots }));
   });
 
-  router.post("/oauth/authorize", urlencoded({ extended: false }), (req, res) => {
+  router.post("/oauth/authorize", urlencoded({ extended: false }), guard, (req, res) => {
     prunePending();
     const body = req.body as { request_id?: string; pairing_code?: string };
     const request = body.request_id ? pendingRequests.get(body.request_id) : undefined;
@@ -268,6 +276,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
             requestId: request.id,
             workspaceName: deps.workspaceName,
             scopes: request.scopes,
+            authorizedRoots: deps.authorizedRoots,
             error: messages[verdict.reason] ?? "Verification failed.",
           })
         );
@@ -291,7 +300,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
   // ---- Token endpoint --------------------------------------------------------
 
-  router.post("/oauth/token", urlencoded({ extended: false }), json(), (req, res) => {
+  router.post("/oauth/token", urlencoded({ extended: false }), json(), guard, (req, res) => {
     const body = req.body as Record<string, string | undefined>;
     const grantType = body.grant_type;
 
@@ -353,7 +362,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
   // ---- Revocation (RFC 7009) ---------------------------------------------------
 
-  router.post("/oauth/revoke", urlencoded({ extended: false }), (req, res) => {
+  router.post("/oauth/revoke", urlencoded({ extended: false }), guard, (req, res) => {
     const body = req.body as { token?: string };
     if (body.token) deps.store.revokeToken(body.token);
     res.status(200).json({});

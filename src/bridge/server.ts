@@ -2,6 +2,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import { Workspace } from "../workspace/manager.js";
+import { WorkspaceRoots } from "../workspace/roots.js";
 import { AuthStore } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
@@ -82,12 +83,13 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
+  const roots = new WorkspaceRoots(workspace);
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
   }
 
-  const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
+  const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile, authorizationRevision: roots.authorizationRevision });
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
@@ -111,6 +113,15 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
   });
 
+  // Existing bridge instances fail closed immediately after a local grant edit.
+  // Health and guarded admin routes remain available for diagnosis/shutdown.
+  const authorizationGuard = (_req: Request, res: Response, next: NextFunction): void => {
+    try { roots.assertCurrent(); next(); } catch {
+      res.status(503).json({ error: "root_authorization_changed", error_description: "Restart this workspace bridge and reauthorize its connector." });
+    }
+  };
+  app.use("/oauth", authorizationGuard);
+
   // ---- OAuth + discovery ---------------------------------------------------
 
   app.use(
@@ -118,6 +129,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       store: authStore,
       pairing,
       workspaceName: workspace.name,
+      authorizationGuard,
+      authorizedRoots: roots.authorizationRevision ? roots.catalog().map(r => r.name) : undefined,
       getBaseUrl,
       logger,
     })
@@ -125,11 +138,12 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
-  const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
+  const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, roots, logger }), logger);
   app.all(
     "/mcp",
     express.json({ limit: "8mb" }),
     bearerAuth({ store: authStore, workspaceId: workspace.id, getBaseUrl, logger }),
+    authorizationGuard,
     (req: Request, res: Response) => {
       void mcpHandler(req, res);
     }
@@ -151,13 +165,15 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     next();
   };
 
-  app.post("/admin/pairing", adminGuard, (_req, res) => {
+  app.post("/admin/pairing", adminGuard, authorizationGuard, (_req, res) => {
     const session = pairing.create();
     logger.info("Created pairing session");
     res.json({ code: session.code, expiresAt: session.expiresAt });
   });
 
   app.get("/admin/info", adminGuard, (_req, res) => {
+    let rootsCurrent = true;
+    try { roots.assertCurrent(); } catch { rootsCurrent = false; }
     res.json({
       service: SERVICE_NAME,
       version: VERSION,
@@ -168,6 +184,11 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       publicUrl: publicBaseUrl,
       tunnel: tunnel.status(),
       tokenCount: authStore.tokenCount(),
+      rootAuthorization: {
+        current: rootsCurrent,
+        managed: Boolean(roots.authorizationRevision),
+        reauthorizationRequired: Boolean(roots.authorizationRevision) && authStore.tokenCount() === 0,
+      },
       pairingActive: pairing.hasActiveSession(),
       pid: process.pid,
       startedAt,

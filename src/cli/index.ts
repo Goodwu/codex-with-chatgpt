@@ -59,6 +59,8 @@ import {
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { importMediaAsset } from "../media/import.js";
+import { WorkspaceRoots } from "../workspace/roots.js";
+import { registerRootCommands } from "./roots.js";
 
 const program = new Command();
 
@@ -187,6 +189,7 @@ interface AdminInfo {
   publicUrl: string | null;
   tunnel: { running: boolean; url: string | null; provider: string };
   tokenCount: number;
+  rootAuthorization?: { current: boolean; managed: boolean; reauthorizationRequired: boolean };
   pairingActive: boolean;
   pid: number;
   startedAt: string;
@@ -224,6 +227,8 @@ program
 function acceptUnusedWorkspaceOption(command: Command): Command {
   return command.option("-w, --workspace <path>", "ignored; this command is machine-wide");
 }
+
+registerRootCommands(program);
 
 // ---------------------------------------------------------------- serve (internal)
 
@@ -431,6 +436,7 @@ program
     const root = resolveWorkspace(opts.workspace);
     const report: Record<string, { ok: boolean; detail?: string }> = {};
     const results: string[] = [];
+    let rootRepair = { needed: false, restartRequired: false, reauthorizationRequired: false };
 
     // Node
     const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
@@ -460,8 +466,11 @@ program
     let workspace: Workspace | null = null;
     try {
       workspace = new Workspace(root);
+      const roots = new WorkspaceRoots(workspace);
+      report.roots = { ok: true, detail: `${roots.catalog().length} authorized directories` };
       report.workspace = { ok: true, detail: workspace.name };
     } catch (error) {
+      workspace = null; // Never repair/restart from invalid authorization state.
       report.workspace = { ok: false, detail: (error as Error).message };
     }
 
@@ -549,7 +558,13 @@ program
 
     if (runtime) {
       let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-      if (namedReady && !namedCredentialFailure && opts.fix && info.tunnel.provider !== "cloudflare-named") {
+      if (info.rootAuthorization?.current === false) {
+        report.roots = { ok: false, detail: "Directory authorization changed; restart this bridge before reconnecting." };
+        rootRepair = { needed: true, restartRequired: true, reauthorizationRequired: true };
+      } else if (info.rootAuthorization?.reauthorizationRequired) {
+        rootRepair = { needed: true, restartRequired: false, reauthorizationRequired: true };
+      }
+      if (!rootRepair.restartRequired && namedReady && !namedCredentialFailure && opts.fix && info.tunnel.provider !== "cloudflare-named") {
         await stopBridge(root);
         await new Promise((resolve) => setTimeout(resolve, 400));
         try {
@@ -572,7 +587,7 @@ program
         }
       }
 
-      if ((!currentUrl || !healthy) && !namedCredentialFailure && opts.fix && (expectedPublic || info.tunnel.running)) {
+      if (!rootRepair.restartRequired && (!currentUrl || !healthy) && !namedCredentialFailure && opts.fix && (expectedPublic || info.tunnel.running)) {
         try {
           const binaries = detectTunnelBinaries();
           if (!binaries.cloudflared) {
@@ -675,10 +690,16 @@ program
       };
     }
 
+    if (rootRepair.reauthorizationRequired && !rootRepair.restartRequired && chatgptRepair.mcpUrl) {
+      chatgptRepair = {
+        ...chatgptRepair, needed: true, reason: "root_authorization_changed", connectorAction: "update",
+        userMessage: `目录授权已变更，需要重新授权「${connectorName}」。保留原来的 Project 和对话，不修改其它项目的连接。`,
+      };
+    }
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair }));
+      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair, rootRepair }));
       const hasFailures =
-        Object.values(report).some((value) => !value.ok) || chatgptRepair.needed || namedRepair.needed;
+        Object.values(report).some((value) => !value.ok) || chatgptRepair.needed || namedRepair.needed || rootRepair.needed;
       if (hasFailures) process.exitCode = 1;
       return;
     }
@@ -688,6 +709,7 @@ program
       node: "Node.js",
       sandbox: "Sandbox",
       workspace: "Workspace",
+      roots: "Directory authorization",
       bridge: "Bridge",
       mcp: "MCP",
       oauth: "OAuth",
@@ -715,15 +737,17 @@ program
       say("");
     }
     say(
-      allOk && !chatgptRepair.needed && !namedRepair.needed
+      allOk && !chatgptRepair.needed && !namedRepair.needed && !rootRepair.needed
         ? "Everything looks good."
+        : rootRepair.restartRequired
+          ? "目录授权已变更，请先重启该工作区，再重新授权原来的连接。"
         : chatgptRepair.needed
           ? "本地已就绪，还需要在 ChatGPT 删除并重新添加该连接。"
           : namedRepair.needed
             ? "固定域名需要先按上面的诊断提示处理。"
             : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
     );
-    if (!allOk || namedRepair.needed) process.exitCode = 1;
+    if (!allOk || namedRepair.needed || rootRepair.needed) process.exitCode = 1;
   });
 
 // ---------------------------------------------------------------- pair / unpair

@@ -3,11 +3,13 @@ import { z } from "zod";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { gitDiff, gitInfo, gitStatus, type DiffMode } from "../workspace/git.js";
+import { gitDiff, gitStatus, type DiffMode } from "../workspace/git.js";
 import { executionRecordSchema, latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
 import { listExecutionOutputs, readExecutionOutput } from "../execution/output.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
+import { WorkspaceRoots } from "../workspace/roots.js";
+import { RootGrantError } from "../workspace/root-grants.js";
 import { readWorkspaceImage } from "../workspace/media.js";
 
 const UNTRUSTED_NOTE =
@@ -36,8 +38,8 @@ function fail(code: string, message: string): ToolResult {
 }
 
 function mapError(error: unknown): ToolResult {
-  if (error instanceof WorkspaceError) return fail(error.code, error.message);
-  return fail("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
+  if (error instanceof WorkspaceError || error instanceof RootGrantError) return fail(error.code, error.message);
+  return fail("INTERNAL_ERROR", "The operation could not be completed safely.");
 }
 
 function requireScope(authInfo: AuthInfo | undefined, scope: string): ToolResult | null {
@@ -57,9 +59,11 @@ const gitIdentityOutputSchema = z.object({
 });
 
 const workspaceInfoOutputSchema = {
+  root: z.string().optional(),
   workspaceId: z.string(),
   workspaceName: z.string(),
   rootAlias: z.string(),
+  roots: z.array(z.object({ name: z.string(), isPrimary: z.boolean(), readOnly: z.boolean() })),
   projectType: z.string(),
   languages: z.array(z.string()),
   frameworks: z.array(z.string()),
@@ -75,6 +79,7 @@ const directoryEntryOutputSchema = z.object({
 });
 
 const listDirectoryOutputSchema = {
+  root: z.string().optional(),
   path: z.string(),
   entries: z.array(directoryEntryOutputSchema),
   total: z.number().int().nonnegative(),
@@ -84,6 +89,7 @@ const listDirectoryOutputSchema = {
 };
 
 const readFileOutputSchema = {
+  root: z.string().optional(),
   path: z.string(),
   sizeBytes: z.number().int().nonnegative(),
   totalLines: z.number().int().nonnegative(),
@@ -96,6 +102,7 @@ const readFileOutputSchema = {
 };
 
 const readImageOutputSchema = {
+  root: z.string().optional(),
   path: z.string(),
   sizeBytes: z.number().int().nonnegative(),
   mimeType: z.string(),
@@ -108,6 +115,7 @@ const searchMatchOutputSchema = z.object({
 });
 
 const searchWorkspaceOutputSchema = {
+  root: z.string().optional(),
   matches: z.array(searchMatchOutputSchema),
   matchCount: z.number().int().nonnegative(),
   truncated: z.boolean(),
@@ -120,6 +128,7 @@ const gitChangeOutputSchema = z.object({
 });
 
 const gitStatusOutputSchema = {
+  root: z.string().optional(),
   isRepo: z.boolean(),
   branch: z.string().nullable(),
   upstream: z.string().nullable(),
@@ -136,6 +145,7 @@ const gitStatusOutputSchema = {
 };
 
 const gitDiffOutputSchema = {
+  root: z.string().optional(),
   isRepo: z.boolean(),
   mode: z.enum(["unstaged", "staged", "head"]),
   totalBytes: z.number().int().nonnegative(),
@@ -189,11 +199,24 @@ const executionOutputOutputSchema = {
 
 export interface McpContext {
   workspace: Workspace;
+  roots?: WorkspaceRoots;
   logger: Logger;
 }
 
 export function createMcpServer(ctx: McpContext): McpServer {
   const { workspace } = ctx;
+  const roots = ctx.roots ?? new WorkspaceRoots(workspace);
+  // Fence asynchronous reads: a changed grant set cannot return stale data.
+  const run = async (operation: () => Promise<ToolResult>): Promise<ToolResult> => {
+    try {
+      roots.assertCurrent();
+      const result = await operation();
+      roots.assertCurrent();
+      return result;
+    } catch (error) { return mapError(error); }
+  };
+  const rootInput = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/).default("main")
+    .describe("Authorized directory alias from workspace_info; defaults to main. Paths are relative to this root.");
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
     { capabilities: { tools: {} }, instructions: UNTRUSTED_NOTE }
@@ -206,31 +229,36 @@ export function createMcpServer(ctx: McpContext): McpServer {
       description:
         `Get an overview of the connected workspace: identity, project type, languages, ` +
         `frameworks, git state and available scripts. Call this first. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      inputSchema: { root: rootInput },
       outputSchema: workspaceInfoOutputSchema,
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.read");
-      if (denied) return denied;
-      try {
-        const project = workspace.detectProject();
-        const git = gitInfo(workspace.root);
-        return okStructured({
-          workspaceId: workspace.id,
-          workspaceName: workspace.name,
-          rootAlias: "workspace:/",
-          ...project,
-          git: {
-            isRepo: git.isRepo,
-            branch: git.branch,
-            commit: git.commit,
-            dirty: git.dirty,
-          },
-        });
-      } catch (error) {
-        return mapError(error);
-      }
+    async (args, extra) => {
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "workspace.read");
+        if (denied) return denied;
+        try {
+          const selected = roots.select(args.root);
+          const project = selected.detectProject();
+          const git = roots.info(args.root);
+          return okStructured({
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+            rootAlias: "workspace:/",
+            root: args.root,
+            roots: roots.catalog(),
+            ...project,
+            git: {
+              isRepo: git.isRepo,
+              branch: git.branch,
+              commit: git.commit,
+              dirty: git.dirty,
+            },
+          });
+        } catch (error) {
+          return mapError(error);
+        }
+      });
     }
   );
 
@@ -242,6 +270,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `List files and directories under a workspace-relative path. High-noise directories ` +
         `(node_modules, .git, build output) are omitted. Supports pagination. ${UNTRUSTED_NOTE}`,
       inputSchema: {
+        root: rootInput,
         path: z.string().default(".").describe("Workspace-relative path, e.g. 'src'"),
         depth: z.number().int().min(1).max(4).default(1).describe("Recursion depth (1-4)"),
         limit: z.number().int().min(1).max(1000).default(200),
@@ -251,13 +280,16 @@ export function createMcpServer(ctx: McpContext): McpServer {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.read");
-      if (denied) return denied;
-      try {
-        return okStructured(await workspace.listDirectory(args.path, args));
-      } catch (error) {
-        return mapError(error);
-      }
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "workspace.read");
+        if (denied) return denied;
+        try {
+          const selected = roots.select(args.root);
+          return okStructured(roots.tag(args.root, await selected.listDirectory(args.path, args)));
+        } catch (error) {
+          return mapError(error);
+        }
+      });
     }
   );
 
@@ -270,6 +302,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `400 lines; use start_line/end_line to page through large files. Sensitive files ` +
         `(.env, keys, credentials) are always denied. ${UNTRUSTED_NOTE}`,
       inputSchema: {
+        root: rootInput,
         path: z.string().describe("Workspace-relative file path"),
         start_line: z.number().int().min(1).optional().describe("1-based first line to return"),
         end_line: z.number().int().min(1).optional().describe("1-based last line to return"),
@@ -278,13 +311,16 @@ export function createMcpServer(ctx: McpContext): McpServer {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.read");
-      if (denied) return denied;
-      try {
-        return okStructured(await workspace.readFile(args.path, { startLine: args.start_line, endLine: args.end_line }));
-      } catch (error) {
-        return mapError(error);
-      }
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "workspace.read");
+        if (denied) return denied;
+        try {
+          const selected = roots.select(args.root);
+          return okStructured(roots.tag(args.root, await selected.readFile(args.path, { startLine: args.start_line, endLine: args.end_line })));
+        } catch (error) {
+          return mapError(error);
+        }
+      });
     }
   );
 
@@ -295,26 +331,29 @@ export function createMcpServer(ctx: McpContext): McpServer {
       description:
         `View a PNG, JPEG, GIF, WebP, or SVG image from the workspace. Images are capped at ` +
         `10 MiB and sensitive-file/path policies still apply. ${UNTRUSTED_NOTE}`,
-      inputSchema: { path: z.string().describe("Workspace-relative image path") },
+      inputSchema: { root: rootInput, path: z.string().describe("Workspace-relative image path") },
       outputSchema: readImageOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.read");
-      if (denied) return denied;
-      try {
-        const image = await readWorkspaceImage(workspace, args.path);
-        const metadata = { path: image.path, sizeBytes: image.sizeBytes, mimeType: image.mimeType };
-        return {
-          content: [
-            { type: "text", text: JSON.stringify(metadata, null, 2) },
-            { type: "image", data: image.data, mimeType: image.mimeType },
-          ],
-          structuredContent: metadata,
-        };
-      } catch (error) {
-        return mapError(error);
-      }
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "workspace.read");
+        if (denied) return denied;
+        try {
+          const selected = roots.select(args.root);
+          const image = await readWorkspaceImage(selected, args.path);
+          const metadata = roots.tag(args.root, { path: image.path, sizeBytes: image.sizeBytes, mimeType: image.mimeType });
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(metadata, null, 2) },
+              { type: "image", data: image.data, mimeType: image.mimeType },
+            ],
+            structuredContent: metadata,
+          };
+        } catch (error) {
+          return mapError(error);
+        }
+      });
     }
   );
 
@@ -326,6 +365,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `Search file contents across the workspace (ripgrep when available). Returns matching ` +
         `lines with file paths and line numbers. ${UNTRUSTED_NOTE}`,
       inputSchema: {
+        root: rootInput,
         query: z.string().min(2).describe("Text to search for (literal by default)"),
         path: z.string().optional().describe("Restrict search to this workspace-relative path"),
         glob: z.string().optional().describe("Filename glob filter, e.g. '*.ts'"),
@@ -336,13 +376,16 @@ export function createMcpServer(ctx: McpContext): McpServer {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.search");
-      if (denied) return denied;
-      try {
-        return okStructured(await searchWorkspace(workspace, args));
-      } catch (error) {
-        return mapError(error);
-      }
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "workspace.search");
+        if (denied) return denied;
+        try {
+          const selected = roots.select(args.root);
+          return okStructured(roots.tag(args.root, await searchWorkspace(selected, args)));
+        } catch (error) {
+          return mapError(error);
+        }
+      });
     }
   );
 
@@ -351,18 +394,21 @@ export function createMcpServer(ctx: McpContext): McpServer {
     {
       title: "Git status",
       description: `Structured git status of the workspace: branch, staged/unstaged/untracked files. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      inputSchema: { root: rootInput },
       outputSchema: gitStatusOutputSchema,
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
-      const denied = requireScope(extra.authInfo, "git.read");
-      if (denied) return denied;
-      try {
-        return okStructured(gitStatus(workspace));
-      } catch (error) {
-        return mapError(error);
-      }
+    async (args, extra) => {
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "git.read");
+        if (denied) return denied;
+        try {
+          const selected = roots.git(args.root);
+          return okStructured(roots.tag(args.root, gitStatus(selected)));
+        } catch (error) {
+          return mapError(error);
+        }
+      });
     }
   );
 
@@ -374,6 +420,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `Git diff with byte-offset pagination. mode: 'unstaged' (default), 'staged', or 'head' ` +
         `(working tree vs HEAD). When hasMore is true, call again with offset=nextOffset. ${UNTRUSTED_NOTE}`,
       inputSchema: {
+        root: rootInput,
         mode: z.enum(["unstaged", "staged", "head"]).default("unstaged"),
         path: z.string().optional().describe("Limit the diff to one workspace-relative path"),
         offset: z.number().int().min(0).default(0).describe("Byte offset for pagination"),
@@ -383,23 +430,26 @@ export function createMcpServer(ctx: McpContext): McpServer {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "git.read");
-      if (denied) return denied;
-      try {
-        let relPath: string | undefined;
-        if (args.path) {
-          relPath = workspace.resolve(args.path).rel;
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "git.read");
+        if (denied) return denied;
+        try {
+          const selected = roots.git(args.root);
+          let relPath: string | undefined;
+          if (args.path) {
+            relPath = selected.resolve(args.path).rel;
+          }
+          return okStructured(roots.tag(args.root,
+            gitDiff(
+              selected,
+              { mode: args.mode as DiffMode, offset: args.offset, maxBytes: args.max_bytes },
+              relPath
+            )
+          ));
+        } catch (error) {
+          return mapError(error);
         }
-        return okStructured(
-          gitDiff(
-            workspace,
-            { mode: args.mode as DiffMode, offset: args.offset, maxBytes: args.max_bytes },
-            relPath
-          )
-        );
-      } catch (error) {
-        return mapError(error);
-      }
+      });
     }
   );
 
@@ -415,22 +465,24 @@ export function createMcpServer(ctx: McpContext): McpServer {
       annotations: { readOnlyHint: true },
     },
     async (_args, extra) => {
-      const denied = requireScope(extra.authInfo, "execution.read");
-      if (denied) return denied;
-      const latest = latestExecutionRecord(workspace.id);
-      if (!latest) {
-        return okStructured({ available: false, message: "No execution records yet for this workspace." });
-      }
-      return okStructured({
-        available: true,
-        taskId: latest.taskId,
-        iteration: latest.iteration,
-        tests: latest.tests,
-        exitStatus: latest.exitStatus,
-        timestamp: latest.timestamp,
-        executor: latest.executor,
-        outputAvailable: Boolean(latest.outputAvailable),
-        outputId: latest.outputId ?? null,
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "execution.read");
+        if (denied) return denied;
+        const latest = latestExecutionRecord(workspace.id);
+        if (!latest) {
+          return okStructured({ available: false, message: "No execution records yet for this workspace." });
+        }
+        return okStructured({
+          available: true,
+          taskId: latest.taskId,
+          iteration: latest.iteration,
+          tests: latest.tests,
+          exitStatus: latest.exitStatus,
+          timestamp: latest.timestamp,
+          executor: latest.executor,
+          outputAvailable: Boolean(latest.outputAvailable),
+          outputId: latest.outputId ?? null,
+        });
       });
     }
   );
@@ -449,9 +501,11 @@ export function createMcpServer(ctx: McpContext): McpServer {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "execution.read");
-      if (denied) return denied;
-      return okStructured({ records: readExecutionRecords(workspace.id, args.limit) });
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "execution.read");
+        if (denied) return denied;
+        return okStructured({ records: readExecutionRecords(workspace.id, args.limit) });
+      });
     }
   );
 
@@ -472,40 +526,42 @@ export function createMcpServer(ctx: McpContext): McpServer {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "execution.read");
-      if (denied) return denied;
-      const action = args.action ?? "list";
-      if (action === "list") {
-        const items = listExecutionOutputs(workspace.id, args.limit).map((item) => ({
-          id: item.id,
-          command: item.command,
-          exitCode: item.exitCode,
-          timestamp: item.timestamp,
-          taskId: item.taskId ?? null,
-          iteration: item.iteration ?? null,
-          readable: item.allowed,
-          status: item.allowed ? "readable" : "restricted",
-          truncated: item.truncated,
-          sizeBytes: item.sizeBytes,
-        }));
-        return okStructured({ action: "list", items });
-      }
-      if (args.id === undefined) return fail("INVALID_ARGUMENTS", "read requires id");
-      const result = readExecutionOutput(workspace.id, args.id);
-      if (!result.ok) {
-        if (result.error === "OUTPUT_RESTRICTED") {
-          return fail("OUTPUT_RESTRICTED", "This output was not released for ChatGPT to read.");
+      return run(async () => {
+        const denied = requireScope(extra.authInfo, "execution.read");
+        if (denied) return denied;
+        const action = args.action ?? "list";
+        if (action === "list") {
+          const items = listExecutionOutputs(workspace.id, args.limit).map((item) => ({
+            id: item.id,
+            command: item.command,
+            exitCode: item.exitCode,
+            timestamp: item.timestamp,
+            taskId: item.taskId ?? null,
+            iteration: item.iteration ?? null,
+            readable: item.allowed,
+            status: item.allowed ? "readable" : "restricted",
+            truncated: item.truncated,
+            sizeBytes: item.sizeBytes,
+          }));
+          return okStructured({ action: "list", items });
         }
-        return fail("NOT_FOUND", `No execution output with id ${args.id}.`);
-      }
-      return okStructured({
-        action: "read",
-        id: result.meta.id,
-        command: result.meta.command,
-        exitCode: result.meta.exitCode,
-        timestamp: result.meta.timestamp,
-        truncated: result.meta.truncated,
-        text: result.text,
+        if (args.id === undefined) return fail("INVALID_ARGUMENTS", "read requires id");
+        const result = readExecutionOutput(workspace.id, args.id);
+        if (!result.ok) {
+          if (result.error === "OUTPUT_RESTRICTED") {
+            return fail("OUTPUT_RESTRICTED", "This output was not released for ChatGPT to read.");
+          }
+          return fail("NOT_FOUND", `No execution output with id ${args.id}.`);
+        }
+        return okStructured({
+          action: "read",
+          id: result.meta.id,
+          command: result.meta.command,
+          exitCode: result.meta.exitCode,
+          timestamp: result.meta.timestamp,
+          truncated: result.meta.truncated,
+          text: result.text,
+        });
       });
     }
   );

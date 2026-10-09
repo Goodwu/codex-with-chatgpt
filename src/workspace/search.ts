@@ -75,7 +75,7 @@ async function searchWithRipgrep(
   limit: number
 ): Promise<SearchResult> {
   // One extra match per file is sufficient to detect global truncation.
-  const args = ["--json", "--max-filesize", "2M", "--max-count", String(limit + 1)];
+  const args = ["--no-config", "--no-follow", "--json", "--max-filesize", "2M", "--max-count", String(limit + 1)];
   if (!opts.regex) args.push("-F");
   args.push("--smart-case");
   if (opts.glob) args.push("-g", opts.glob);
@@ -96,6 +96,7 @@ async function searchWithRipgrep(
         if (event.type !== "match" || !event.data?.path?.text) return;
         const rel = path.relative(ws.root, event.data.path.text).split(path.sep).join("/");
         if (rel.startsWith("..") || ws.ignoreRules.isHidden(rel)) return;
+        ws.resolve(rel); // recheck the selected root, not the union of roots
         // Metadata and hidden matches do not indicate omitted visible results.
         if (matches.length >= limit) {
           truncated = true;
@@ -156,7 +157,8 @@ async function searchWithNode(
         if (stat.size > 2 * 1024 * 1024) continue;
         let content: string;
         try {
-          content = await fs.promises.readFile(childAbs, "utf8");
+          const checked = ws.resolve(childRel);
+          content = await fs.promises.readFile(checked.abs, "utf8");
         } catch {
           continue;
         }

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import os from "node:os";
 import { IgnoreRules } from "./ignore.js";
 
 export interface GitCommandResult {
@@ -9,7 +10,30 @@ export interface GitCommandResult {
 }
 
 export function runGit(root: string, args: string[]): GitCommandResult {
-  const result = spawnSync("git", args, {
+  // Do not inherit repository-routing variables or execute configured helpers.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !key.toUpperCase().startsWith("GIT_") || key.toUpperCase() === "GIT_CEILING_DIRECTORIES"
+  ));
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: os.devNull,
+    GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: "0" });
+  const safeArgs = ["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false"];
+  if (args[0] === "diff" || args[0] === "status") {
+    // Even a diff can invoke clean/process filters selected by .gitattributes.
+    // Enumerate names only, then override all executable filter directions.
+    const filters = spawnSync("git", [...safeArgs, "config", "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|smudge|process|required)$"], {
+      cwd: root, env, encoding: "utf8", maxBuffer: 256 * 1024, timeout: 5000, windowsHide: true,
+    });
+    if (filters.status !== 0 && filters.status !== 1) {
+      return { ok: false, stdout: "", stderr: "Cannot safely inspect Git filters.", code: filters.status };
+    }
+    const drivers = new Set((filters.stdout ?? "").split("\0").filter(Boolean).map(key => key.slice(0, key.lastIndexOf("."))));
+    for (const driver of drivers) {
+      for (const direction of ["clean", "smudge", "process"]) safeArgs.push("-c", `${driver}.${direction}=`);
+      safeArgs.push("-c", `${driver}.required=false`);
+    }
+  }
+  const result = spawnSync("git", [...safeArgs, ...args], {
+    env,
     cwd: root,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
@@ -205,6 +229,8 @@ export function gitDiff(
   // 1. Full-workspace inventory using NUL separation and global rename detection
   const listArgs = [
     "diff",
+    "--no-ext-diff",
+    "--no-textconv",
     "--name-status",
     "-z",
     "--find-renames=1%",
@@ -278,6 +304,8 @@ export function gitDiff(
     const pathspecs = batch.map((p) => `:(literal)${p}`);
     const diffArgs = [
       "diff",
+      "--no-ext-diff",
+      "--no-textconv",
       "--no-color",
       "--find-renames=1%",
       ...modeArgs,

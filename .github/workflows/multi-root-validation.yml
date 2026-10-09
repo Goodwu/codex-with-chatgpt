@@ -7,7 +7,11 @@ permissions:
   contents: read
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -25,18 +29,4 @@ jobs:
           corepack pnpm typecheck
           corepack pnpm build
       - name: Test
-        run: corepack pnpm test
-      - name: Package reproducible validation fixture
-        if: always()
-        run: |
-          mkdir -p /tmp/c2c-validation
-          git archive --format=tar HEAD > /tmp/c2c-validation/source.tar
-          if [ -d node_modules ]; then
-            tar -czf /tmp/c2c-validation/dependencies.tgz node_modules
-          fi
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: validation-fixture
-          path: /tmp/c2c-validation/
-          retention-days: 1
+        run: corepack pnpm test --maxWorkers=2
