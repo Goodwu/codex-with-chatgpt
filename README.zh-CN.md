@@ -16,6 +16,10 @@ ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
 Codex 手里。你的仓库永远不会被上传——ChatGPT 通过一条安全的、OAuth 保护的
 **只读** MCP 连接，按需读取当前工作区里它真正需要的那几行代码。
 
+> **多目录功能分支：** 请构建 `Goodwu/codex-with-chatgpt` 的
+> `feat/secure-multi-root-hardened` 分支并安装其中的 Skill。下面保留的上游安装指令
+> 不会安装此分支；多目录流程见 [使用说明](docs/multi-root.md)。
+
 ## 一段话安装（纯小白专用）
 
 不懂 git、Node、终端？完全不需要懂。把下面这段话原样复制给你的编码
@@ -85,6 +89,24 @@ Ready.
 
 凭证放在系统目录，不进项目。
 
+## 一个项目使用多个目录
+
+不必把多个仓库搬到共同父目录，也不必为它们新建多个 ChatGPT Project：
+
+```bash
+c2c roots add mpv ~/src/mpv -w ~/src/media-kit --approve --json
+c2c roots add ffmpeg ~/src/ffmpeg -w ~/src/media-kit --approve --json
+c2c setup -w ~/src/media-kit --json
+```
+
+`-w` 始终指定主目录；`--approve` 表示明确批准 ChatGPT 只读访问该实际路径。
+不带 `--approve` 会先展示路径，不修改授权。添加或移除目录后，需要重新为
+同名连接器配对；保留原来的 Project 和对话。每个目录独立执行路径、敏感文件
+和 Git 审查检查，旧令牌不会自动获得新目录权限。支持最多 16 个不重叠根目录。
+
+也可以让 Codex 按已更新的 Skill 完成上述流程。
+详见 [多目录使用、安全模型与恢复说明](docs/multi-root.md)。
+
 ## 工作原理
 
 ```
@@ -106,7 +128,7 @@ Ready.
                         ▼
              ┌─────────────────────┐          ┌─────────────────────┐
              │     本地工作区      │◀─────────│    Codex Harness    │
-             └─────────────────────┘ 编辑/git │  Shell / 测试 / 修复 │
+             └─────────────────────┘ 编辑/git │ shell / tests / fix │
                                               └─────────────────────┘
 ```
 
@@ -147,7 +169,7 @@ Ready.
 ```bash
 pnpm install
 pnpm build          # 产出 dist/，暴露 c2c 命令
-pnpm test           # vitest：150 个测试（路径安全、OAuth、配对、MCP 端到端）
+pnpm test           # vitest：单元与集成测试（路径、多根目录、OAuth、配对、MCP）
 
 c2c setup           # 一条命令：Bridge + 隧道 + 配对码
 c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS / Windows）
@@ -166,7 +188,7 @@ c2c status / doctor / pair / unpair / logs / stop
 ```
 src/
   bridge/     本机回环 HTTP 服务、端口自动恢复、管理 API
-  mcp/        9 个只读工具、无状态 Streamable HTTP
+  mcp/        10 个只读工具、无状态 Streamable HTTP
   auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
   pairing/    一次性配对码（CSPRNG、TTL、限速）
   workspace/  路径收敛、敏感文件策略、搜索、git

@@ -136,7 +136,7 @@ describe("MCP tools over Streamable HTTP", () => {
 
   it("read_image returns metadata and image content", async () => {
     const result = await client.callTool({ name: "read_image", arguments: { path: "pixel.png" } });
-    expect(result.structuredContent).toEqual({ path: "pixel.png", sizeBytes: 11, mimeType: "image/png" });
+    expect(result.structuredContent).toEqual({ root: "main", path: "pixel.png", sizeBytes: 11, mimeType: "image/png" });
     const content = result.content as { type: string; mimeType?: string }[];
     expect(content.some((item) => item.type === "image" && item.mimeType === "image/png")).toBe(true);
   });

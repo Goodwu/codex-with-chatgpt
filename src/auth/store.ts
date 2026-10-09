@@ -27,6 +27,7 @@ export interface AuthorizationCodeRecord {
   codeChallenge: string;
   scopes: string[];
   workspaceId: string;
+  authorizationVersion?: string;
   pairingSessionId: string;
   resource?: string;
   expiresAt: number;
@@ -37,6 +38,7 @@ export interface TokenRecord {
   kind: "access" | "refresh";
   clientId: string;
   workspaceId: string;
+  authorizationVersion?: string;
   scopes: string[];
   issuedAt: number;
   expiresAt: number;
@@ -81,11 +83,13 @@ export class AuthStore {
   private tokens = new Map<string, TokenRecord>();
   private authCodes = new Map<string, AuthorizationCodeRecord>();
   private readonly file: string;
+  private readonly authorizationVersion: string | undefined;
 
   constructor(
     readonly workspaceId: string,
-    opts: { file?: string } = {}
+    opts: { file?: string; authorizationVersion?: string } = {}
   ) {
+    this.authorizationVersion = opts.authorizationVersion;
     this.file =
       opts.file ?? path.join(ensureDir(path.join(getStateDir(), "auth")), `${workspaceId}.json`);
     this.load();
@@ -97,7 +101,7 @@ export class AuthStore {
     const now = Date.now();
     for (const client of data.clients ?? []) this.clients.set(client.clientId, client);
     for (const token of data.tokens ?? []) {
-      if (!token.revoked && token.expiresAt > now) this.tokens.set(token.hash, token);
+      if (!token.revoked && token.expiresAt > now && token.authorizationVersion === this.authorizationVersion) this.tokens.set(token.hash, token);
     }
   }
 
@@ -146,6 +150,7 @@ export class AuthStore {
       codeChallenge: input.codeChallenge,
       scopes: input.scopes,
       workspaceId: this.workspaceId,
+      authorizationVersion: this.authorizationVersion,
       pairingSessionId: input.pairingSessionId,
       resource: input.resource,
       expiresAt: Date.now() + AUTH_CODE_TTL_MS,
@@ -158,7 +163,7 @@ export class AuthStore {
     const record = this.authCodes.get(code);
     if (!record) return null;
     this.authCodes.delete(code);
-    if (Date.now() > record.expiresAt) return null;
+    if (Date.now() > record.expiresAt || record.authorizationVersion !== this.authorizationVersion) return null;
     return record;
   }
 
@@ -180,6 +185,7 @@ export class AuthStore {
       kind: "access",
       clientId: input.clientId,
       workspaceId,
+      authorizationVersion: this.authorizationVersion,
       scopes: input.scopes,
       issuedAt: now,
       expiresAt: now + accessTtl,
@@ -194,6 +200,7 @@ export class AuthStore {
         kind: "refresh",
         clientId: input.clientId,
         workspaceId,
+        authorizationVersion: this.authorizationVersion,
         scopes: input.scopes,
         issuedAt: now,
         expiresAt: now + REFRESH_TOKEN_TTL_MS,
@@ -213,7 +220,7 @@ export class AuthStore {
     const record = this.tokens.get(sha256hex(token));
     if (!record) return { ok: false, reason: "unknown" };
     if (record.kind !== "access") return { ok: false, reason: "wrong_kind" };
-    if (record.revoked) return { ok: false, reason: "revoked" };
+    if (record.revoked || record.authorizationVersion !== this.authorizationVersion) return { ok: false, reason: "revoked" };
     if (Date.now() > record.expiresAt) return { ok: false, reason: "expired" };
     return { ok: true, record };
   }
@@ -225,7 +232,7 @@ export class AuthStore {
   ): { ok: true; tokens: ReturnType<AuthStore["issueTokens"]> } | { ok: false; reason: string } {
     const record = this.tokens.get(sha256hex(refreshToken));
     if (!record || record.kind !== "refresh") return { ok: false, reason: "invalid_grant" };
-    if (record.revoked) return { ok: false, reason: "invalid_grant" };
+    if (record.revoked || record.authorizationVersion !== this.authorizationVersion || record.workspaceId !== this.workspaceId) return { ok: false, reason: "invalid_grant" };
     if (Date.now() > record.expiresAt) return { ok: false, reason: "invalid_grant" };
     if (record.clientId !== clientId) return { ok: false, reason: "invalid_client" };
     record.revoked = true;

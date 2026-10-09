@@ -32,6 +32,10 @@ workspace.
 
 Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
 
+> **Multi-root fork:** for this feature, build `Goodwu/codex-with-chatgpt`
+> branch `feat/secure-multi-root-hardened` and install its Skill. The upstream installer
+> below does not install this branch. See [multi-root setup](docs/multi-root.md).
+
 ## One-paste install · 一段话安装
 
 **中文** — 不懂 git、Node、终端？完全不需要懂。把下面这段话原样复制给你的
@@ -153,6 +157,22 @@ address — same features, just a slower repair.
 
 Credentials stay in the OS app state directory, not in the project.
 
+## One project, multiple directories
+
+Use one connector and Project for several explicitly approved repositories:
+
+```bash
+c2c roots add mpv ~/src/mpv -w ~/src/media-kit --approve --json
+c2c roots add ffmpeg ~/src/ffmpeg -w ~/src/media-kit --approve --json
+c2c setup -w ~/src/media-kit --json
+```
+
+`--approve` is explicit permission for ChatGPT to read the shown canonical
+directory. Omit it to preview without changing anything. Reauthorize the same
+connector after a root change; preserve the Project and chats. The bridge stays
+read-only, each root keeps its own deny rules and Git review, and old tokens do
+not silently gain access. See [multi-root usage and security](docs/multi-root.md).
+
 ## How it works
 
 ```
@@ -221,7 +241,7 @@ Full threat model: [docs/security.md](docs/security.md)
 ```bash
 pnpm install
 pnpm build          # -> dist/, exposes the `c2c` bin
-pnpm test           # vitest: 150 tests (path security, OAuth, pairing, MCP e2e)
+pnpm test           # vitest: unit and integration tests (paths, roots, OAuth, pairing, MCP)
 
 c2c setup           # bridge + tunnel + pairing code, all in one
 c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
@@ -240,7 +260,7 @@ Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 ```
 src/
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 read-only tools, stateless Streamable HTTP
+  mcp/        10 read-only tools, stateless Streamable HTTP
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
   pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
   workspace/  path containment, sensitive-file policy, search, git

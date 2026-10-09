@@ -75,7 +75,7 @@ async function searchWithRipgrep(
   limit: number
 ): Promise<SearchResult> {
   // One extra match per file is sufficient to detect global truncation.
-  const args = ["--json", "--max-filesize", "2M", "--max-count", String(limit + 1)];
+  const args = ["--no-config", "--no-follow", "--json", "--max-filesize", "2M", "--max-count", String(limit + 1)];
   if (!opts.regex) args.push("-F");
   args.push("--smart-case");
   if (opts.glob) args.push("-g", opts.glob);
@@ -96,6 +96,7 @@ async function searchWithRipgrep(
         if (event.type !== "match" || !event.data?.path?.text) return;
         const rel = path.relative(ws.root, event.data.path.text).split(path.sep).join("/");
         if (rel.startsWith("..") || ws.ignoreRules.isHidden(rel)) return;
+        try { ws.resolve(rel); } catch { return; }
         // Metadata and hidden matches do not indicate omitted visible results.
         if (matches.length >= limit) {
           truncated = true;
@@ -142,7 +143,8 @@ async function searchWithNode(
       if (truncated) return;
       const childRel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
       if (ws.ignoreRules.isHidden(childRel) || ws.ignoreRules.isHidden(childRel + "/")) continue;
-      const childAbs = path.join(dirAbs, entry.name);
+      let childAbs: string;
+      try { childAbs = ws.resolve(childRel).abs; } catch { continue; }
       if (entry.isDirectory()) {
         await walk(childAbs, childRel);
       } else if (entry.isFile()) {

@@ -1,3 +1,4 @@
+import { registerRootsCommand } from "./roots.js";
 import { Command, InvalidArgumentError } from "commander";
 import fs from "node:fs";
 import path from "node:path";
@@ -1301,6 +1302,8 @@ function handleCliError(error: unknown, json: boolean): void {
   }
   process.exitCode = 1;
 }
+
+registerRootsCommand(program);
 
 program.parseAsync(process.argv).catch((error: Error) => {
   cross(error.message);
