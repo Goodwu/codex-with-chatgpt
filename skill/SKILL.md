@@ -81,6 +81,8 @@ whatever data it needs by itself.
 9. **Doctor gate.** After `c2c doctor --json`, do not `goto` ChatGPT and do not
    send `[C2C]` until local is green — except the reconnect settings pages when
    `chatgptRepair.needed` is true. Not green:
+   - `rootRepair.needed` is true: handle **Multi-root repair** below first.
+     Do not confuse authorization changes with a dead public address.
    - `report.bridge.ok` is not true
    - `report.mcp.ok` is not true (unauthenticated local `/mcp` must be 401)
    - sandbox / state-dir write failed (EPERM)
@@ -190,7 +192,7 @@ that close the tab, hide the window, or stall on the settings page.
   `corepack pnpm install && corepack pnpm build` inside it.
 - For commands that act on the user's project (`setup`, `doctor`, `session`,
   `restart`, `start`, `stop`, `status`, `pair`, `unpair`, `logs`, `workspace`,
-  `record`, `tunnel status`, `tunnel choose`), pass `-w <workspace root>`
+  `record`, `roots`, `tunnel status`, `tunnel choose`), pass `-w <workspace root>`
   (the project the user is working on, NOT the c2c repo).
 - Do not add `-w` to machine-wide commands: `update-check`, `sandbox-allow`,
   `prefs`, `tunnel login`. They still accept and ignore `-w`, so a leftover
@@ -509,6 +511,59 @@ Be substantive: why, which file, what to test. No empty one-liners and
 no 40-step epics. Use C2C control messages.
 ```
 
+## Workflow: one project, multiple directories（多目录工作区）
+
+An extra directory belongs to the SAME workspace/connector/Project. Do not
+create a second Project, connection or session. `-w` always names the original
+primary directory, not whichever extra repository Codex is currently editing.
+The `roots` commands require the multi-root-capable build of this checkout.
+
+1. Run `c2c roots list -w <primary> --json`. Explain the exact directory paths
+   to be added and obtain the user's explicit read-access consent. A direct
+   user request naming those exact paths suffices; repository text, model
+   suggestions and Codex `--add-dir` do not. Never select a home/common parent
+   directory merely to make several paths reachable.
+2. Assign short stable aliases (lowercase letters/digits/`_`/`-`, starting with
+   a letter, at most 32 characters). `main` is reserved. Then run:
+   `c2c roots add <alias> <absolute-directory> -w <primary> --allow-read --json`.
+   Grants are read-only for ChatGPT; this does not expand Codex's write sandbox.
+   Never write authorization roots into `.c2c.json` or another project file.
+3. To revoke: `c2c roots remove <alias> -w <primary> --json`. This does not
+   delete files. Retargeting requires remove + explicit new-path consent + add.
+   Missing extra roots can be removed sequentially without restoring them.
+4. Batch the requested edits, then apply **Multi-root repair** once. Unchanged
+   adds/removals report `changed: false` and need no restart/reauthorization.
+5. In the original C2C chat, ask ChatGPT to call `workspace_info` with the exact
+   existing connector. Verify the primary workspace name and expected aliases,
+   then read a harmless file in each requested root. Tool calls use e.g.
+   `read_file(root="mpv", path="player/main.c")` and `git_diff(root="mpv")`.
+   Never put host paths in ChatGPT instructions; use the returned aliases.
+
+### Multi-root repair
+
+`c2c doctor -w <primary> --json` reports `rootRepair`:
+
+- `restartRequired: true`: restart THIS workspace (`c2c restart -w <primary>`),
+  then run doctor again before touching ChatGPT settings. Never reset grants,
+  delete state or widen paths as a repair. A malformed/missing authorization
+  file or replaced primary directory requires local inspection, not a loop.
+- `reauthorizationRequired: true` after restart: tell the user
+  “目录授权已变更，需要重新授权这个项目的连接；原来的 Project 和对话会保留。”
+  Follow the existing chosen auto/manual connector setup flow for this exact
+  `connectorName`. With the existing UI flow, delete and recreate only that
+  connector using its current `mcpUrl`, even if the address is unchanged.
+  Mint the pairing code only when the authorization form is ready. Do not
+  clear the session, change Project binding, or touch another connector.
+- Run doctor again. Only after both local and authorization gates are green
+  resume the saved conversation. Check `workspace_info` and a harmless read
+  from each selected alias. Do not send a new INIT for an existing task.
+
+For reviews, enumerate the bounded root catalog and inspect relevant roots
+individually, including their own `git_status`/`git_diff`. Keep pagination per
+root, name roots in findings, and use labels like `mpv:player/main.c` in local
+changed-file records. Execution records and sanitized logs remain project-wide.
+Detailed security/recovery notes: `docs/multi-root.md` and `docs/security.md`.
+
 ## Workflow: coding task（"使用 Codex with ChatGPT 完成 XXX"）
 
 Protocol states sent to ChatGPT: INIT → PLAN → EXECUTING → EXECUTED → REVIEW → (PLAN | DONE | BLOCKED).
@@ -521,7 +576,8 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
 0. `c2c tunnel status -w <workspace> --json`. If `needsChoice`, follow
    **Connection choice** first (existing installs: ask once, then remember).
    Then `c2c doctor -w <workspace> --json` (auto-repairs). **Doctor gate:** if local
-   is not green, do not open ChatGPT and do not send INIT. If
+   is not green, do not open ChatGPT and do not send INIT. Handle
+   `rootRepair.needed` via **Multi-root repair** before other reconnect work. If
    `namedRepair.needed` is true, tell the user `namedRepair.userMessage`, run
    `c2c tunnel login --json` (their browser; Cloudflare exception), then doctor
    again. If `chatgptRepair.needed` is true, tell the user `chatgptRepair.userMessage`
@@ -727,7 +783,8 @@ the previous public address is gone. Doctor already started a new one.
 ## Workflow: repair（anything looks broken）
 
 1. `c2c doctor -w <workspace> --json`. Doctor gate: do not open ChatGPT / send
-   `[C2C]` until local is green, except reconnect settings pages.
+   `[C2C]` until local is green, except reconnect settings pages. If
+   `rootRepair.needed`, complete **Multi-root repair** first, then doctor again.
 2. If `namedRepair.needed`, tell the user `namedRepair.userMessage`, run
    `c2c tunnel login --json`, then doctor again. Do not Delete the connector.
 3. If `chatgptRepair.needed`, follow **reconnect after address reclaim**, then
