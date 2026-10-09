@@ -127,11 +127,31 @@ Ready.
 `c2c asset import -w <workspace> --from <download> --to <new-path>` 安全导入。
 导入过程限制在工作区内，会验证签名和大小、拒绝活动 SVG，并且绝不覆盖现有文件。
 
+## 一个项目使用多个目录
+
+无需扩大共同父目录，也无需新建第二个 ChatGPT Project。明确授权额外目录后，
+同一个连接可以按别名读取各仓库，并分别审查 Git 状态和 Diff：
+
+```sh
+c2c roots add mpv ~/src/mpv -w ~/src/media-kit --allow-read
+c2c roots add ffmpeg ~/src/ffmpeg -w ~/src/media-kit --allow-read
+c2c roots list -w ~/src/media-kit
+c2c restart -w ~/src/media-kit
+```
+
+随后由 Skill 引导重新授权原来的连接，保留原 Project 和对话。新增目录不会让
+旧令牌自动获得更大的权限。工具使用 `read_file(root="mpv", path="player/main.c")`
+或 `git_diff(root="mpv")`；省略 `root` 仍是主目录 `main`。
+删除授权使用 `c2c roots remove mpv -w ~/src/media-kit`，不会删除目录中的文件。
+
+授权记录只保存在本机私有设置目录，不接受仓库文件声明，也不会自动继承
+Codex 的 `--add-dir`。详见[多目录使用与安全说明](docs/multi-root.md)。
+
 ## 安全模型（简版）
 
 - **从构造上只读**：服务端根本不存在写文件/删除/Shell/提交类工具，任何提示
   注入都无法启用它们。
-- **一个工作区 = 一道边界**：每个令牌绑定单一工作区；路径校验基于规范化
+- **一个项目、明确的目录边界**：每个令牌绑定单一工作区；路径校验基于规范化
   realpath（symlink、`../`、绝对路径逃逸全部被拦截并有测试覆盖）。
 - **敏感文件永不外泄**：`.env*`、密钥、SSH、各类凭据默认拒绝
   （`.env.example` 放行）；`.c2cignore` 可追加自定义规则。
@@ -147,7 +167,7 @@ Ready.
 ```bash
 pnpm install
 pnpm build          # 产出 dist/，暴露 c2c 命令
-pnpm test           # vitest：150 个测试（路径安全、OAuth、配对、MCP 端到端）
+pnpm test           # vitest：安全与回归测试（路径安全、OAuth、配对、MCP 端到端）
 
 c2c setup           # 一条命令：Bridge + 隧道 + 配对码
 c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS / Windows）
@@ -166,7 +186,7 @@ c2c status / doctor / pair / unpair / logs / stop
 ```
 src/
   bridge/     本机回环 HTTP 服务、端口自动恢复、管理 API
-  mcp/        9 个只读工具、无状态 Streamable HTTP
+  mcp/        10 个只读工具、无状态 Streamable HTTP
   auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
   pairing/    一次性配对码（CSPRNG、TTL、限速）
   workspace/  路径收敛、敏感文件策略、搜索、git

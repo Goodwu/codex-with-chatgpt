@@ -2,9 +2,12 @@
 
 ## Trust boundaries
 
-1. **Workspace root** is the smallest authorization boundary. One bridge serves
-   exactly one workspace; every token is bound to `workspace_id`; a token for
-   project A returns 403 on project B's bridge.
+1. **Selected workspace root** is the smallest file-access boundary. One bridge
+   serves exactly one project, with `main` and optionally explicitly authorized
+   extra roots. A request selects one alias, never a union of directories.
+   Every token is bound to `workspace_id`; a token for project A returns 403
+   on project B's bridge. Managed root sets also bind tokens to a fresh
+   authorization revision; edits require restart and reauthorization.
 2. **Workspace content is untrusted.** README, comments, diffs may contain
    prompt injection. Every MCP tool description carries an explicit warning and
    tools never grant capabilities based on file content.
@@ -23,9 +26,9 @@
 | Token theft | Opaque high-entropy tokens; stored only as SHA-256 hashes; access tokens live 1 h; refresh tokens rotate on every use (replay of the old one fails); revocation endpoint + `c2c unpair` |
 | Workspace traversal | `realpath` canonicalization of the deepest existing ancestor; containment check against the canonical root; case-insensitive comparison on macOS/Windows; rejects `..`, absolute escapes, backslash tricks, null bytes |
 | Symlink escape | Canonicalization resolves symlinks before the containment check (file and directory symlinks both covered by tests) |
-| Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, keychains…) enforced at resolve time — reads, listings, and search all pass through the same gate; `git diff` adds pathspec excludes; `.env.example` allowed |
+| Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, keychains…) enforced at resolve time — reads, listings, and search all pass through the same gate; `git diff` inventories changes and selects safe literal pathspecs; `.env.example` allowed |
 | Oversized file / diff DoS | read_file caps lines and bytes per response; git_diff paginates by byte offset with hard caps; search caps matches and file sizes |
-| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the tunnel, protected by OAuth; `/health` reveals only a salted workspace hash |
+| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the tunnel, protected by OAuth; `/health` reveals only a truncated hash of the canonical workspace path (not a secret) |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
 | Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands. |
@@ -37,7 +40,11 @@
 Scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
 `offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`).
 Access tokens: 1 hour. Refresh tokens: 30 days, rotated. All tokens bound to
-`workspace_id` and `client_id`.
+`workspace_id` and `client_id`. Managed root sets additionally bind access tokens,
+refresh tokens and authorization codes to `authorizationRevision`. Existing
+client registrations and project/session identity survive a root edit, but
+old tokens cannot acquire newly authorized directories or be refreshed into
+the new revision. Removing and later re-adding a directory never reuses a revision.
 
 ## Storage
 
@@ -56,3 +63,52 @@ integration is a V2 item.
 Write files, delete files, run shell commands, commit, install packages —
 these tools do not exist on the server, so no prompt injection, scope bug, or
 UI confusion can enable them.
+
+## Multi-root authorization
+
+Directory grants are opt-in local state under `root-grants/<workspaceId>.json`,
+not repository configuration. `c2c roots add ... --allow-read` requires user
+consent for the exact directory. No MCP tool or public admin route can edit
+these grants; `AGENTS.md`, `.c2c.json`, symlinks and Codex `--add-dir` cannot
+silently add them. The executor remains locally trusted, not sandboxed by C2C.
+
+Each root keeps the existing deny list and its own `.c2cignore`. Managed roots
+reject absolute/traversal/drive-stream paths, cross-root symlinks (even between
+allowed roots), overlapping/duplicate roots, sensitive mounts and app-state
+mounts. Canonical path and filesystem identity are pinned. Root aliases, not
+host paths, are exposed in the MCP catalog and pairing page. Metadata reads are
+containment-checked before constructing extra Workspace objects.
+
+A live bridge checks the grant snapshot at request boundaries; all tool
+results are checked again after the operation, so a grant edit during a read
+withholds its result. OAuth handlers check after parsing request bodies too.
+Health and the existing guarded admin surface remain available for repair;
+there is no new remote authorization mutation endpoint. `doctor` reports
+`rootRepair` separately from address/tunnel repair. A reduced set still has a
+new revision; removal never deletes a source directory.
+
+Manifests are bounded, private, owner-checked on POSIX, and reject symlinks and
+hard links. Writes use an exclusive local lock and fsynced atomic replacement;
+an activation marker prevents a missing manifest from silently becoming an
+empty allowlist. Corrupt, replaced and unavailable managed roots fail closed.
+Stale locks and damaged authorization state require local inspection, not an
+automatic reset. This is not protection against a hostile same-user process
+that can edit or remove the entire private state directory, nor a proof against
+all concurrent filesystem races in upstream file/image/search operations.
+On Windows the existing user-private application-directory ACL remains a
+prerequisite; POSIX mode checks are not a replacement for that ACL.
+
+Git review selects the exact managed worktree root and preserves existing
+sensitive-path filtering and pagination. Linked Git worktrees are supported;
+their Git metadata may live outside the worktree, as in normal Git usage.
+Inherited Git routing/configuration variables are removed (the narrowing-only
+`GIT_CEILING_DIRECTORIES` is retained). External diff, textconv and fsmonitor
+and clean/smudge/process filter helpers are disabled; system/global Git config
+is not loaded. Diffs therefore compare raw working-tree content, not filter
+transforms. Ripgrep ignores external configuration and does not
+follow symlinks; returned matches are checked against the selected root.
+
+Execution records/output remain project-wide, explicitly nominated and
+sanitized by the trusted local executor. Removing a directory cannot erase
+content already returned to ChatGPT or previously released execution output.
+Use root-qualified labels in changed-file records. See [multi-root usage](multi-root.md).

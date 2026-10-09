@@ -1,5 +1,4 @@
 import { spawnSync } from "node:child_process";
-import os from "node:os";
 import { IgnoreRules } from "./ignore.js";
 
 export interface GitCommandResult {
@@ -14,8 +13,10 @@ export function runGit(root: string, args: string[]): GitCommandResult {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
     !key.toUpperCase().startsWith("GIT_") || key.toUpperCase() === "GIT_CEILING_DIRECTORIES"
   ));
-  Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: os.devNull,
-    GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: "0" });
+  // Git for Windows explicitly maps /dev/null to its null device. Node's
+  // os.devNull (\\.\nul) is not a valid Git config filename there.
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" });
   const safeArgs = ["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false"];
   if (args[0] === "diff" || args[0] === "status") {
     // Even a diff can invoke clean/process filters selected by .gitattributes.

@@ -198,11 +198,29 @@ original with `c2c asset import -w <workspace> --from <download> --to <new-path>
 Imports are workspace-contained, signature-checked, size-limited, reject active
 SVG content, and never overwrite an existing file.
 
+## One project, multiple directories
+
+The opt-in [multi-root workspace guide](docs/multi-root.md) keeps one connector,
+ChatGPT Project and session identity while authorizing distinct directories:
+
+```sh
+c2c roots add mpv ~/src/mpv -w ~/src/media-kit --allow-read
+c2c roots add ffmpeg ~/src/ffmpeg -w ~/src/media-kit --allow-read
+c2c roots list -w ~/src/media-kit
+c2c restart -w ~/src/media-kit
+```
+
+After editing grants, reauthorize that same connector using the Skill's
+multi-root repair flow. Existing tokens never silently gain new-directory
+access. `read_file(root="mpv", path="player/main.c")` and `git_diff(root="mpv")`
+select one authorized root; omitting `root` selects `main`. Authorization is
+private local state, not a repository manifest or an inherited `--add-dir`.
+
 ## Security model (short version)
 
 - **Read-only by construction**: write/delete/shell/commit tools simply do not
   exist on the server. No prompt injection can enable them.
-- **One workspace = one boundary**: every token is bound to a single workspace;
+- **One project, explicit root boundaries**: every token is bound to a single workspace;
   path containment uses canonical realpaths (symlink/`../`/absolute-path escapes
   are all blocked and tested).
 - **Sensitive files never leave**: `.env*`, keys, SSH, credentials are denied by
@@ -221,7 +239,7 @@ Full threat model: [docs/security.md](docs/security.md)
 ```bash
 pnpm install
 pnpm build          # -> dist/, exposes the `c2c` bin
-pnpm test           # vitest: 150 tests (path security, OAuth, pairing, MCP e2e)
+pnpm test           # vitest: security and regression tests (path security, OAuth, pairing, MCP e2e)
 
 c2c setup           # bridge + tunnel + pairing code, all in one
 c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
@@ -240,7 +258,7 @@ Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 ```
 src/
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 read-only tools, stateless Streamable HTTP
+  mcp/        10 read-only tools, stateless Streamable HTTP
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
   pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
   workspace/  path containment, sensitive-file policy, search, git
