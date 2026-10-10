@@ -41,6 +41,29 @@ describe("per-root read and Git boundaries", () => {
     await expect(ws.readFile("state/runtime/private.json")).rejects.toThrow(/SENSITIVE/);
     expect((await ws.listDirectory(".")).entries.map(e => e.path)).not.toContain("state/");
   });
+  it("does not expose synthetic credentials through direct .git/config reads", async () => {
+    makeGitRepo(repo); git(repo, "config", "review.synthetic", "SYNTHETIC_CONFIG_CREDENTIAL");
+    await expect(new Workspace(repo).readFile(".git/config")).rejects.toMatchObject({ code: "ACCESS_DENIED_SENSITIVE_FILE" });
+  });
+  it("does not expose staged content from an unapproved external .git redirect", () => {
+    makeGitRepo(outside); write(outside, "foreign.txt", "UNAPPROVED_STAGED_CONTENT\n"); git(outside, "add", "foreign.txt");
+    write(repo, ".git", `gitdir: ${path.join(outside, ".git")}\n`);
+    const diff = gitDiff(new Workspace(repo), { mode: "staged" });
+    expect(diff.isRepo).toBe(false); expect(diff.diff).not.toContain("UNAPPROVED_STAGED_CONTENT");
+  });
+  it("does not expand a submodule .env diff under parent diff.submodule=diff", () => {
+    makeGitRepo(repo); makeGitRepo(outside);
+    write(outside, ".env", "SYNTHETIC_SUBMODULE_SECRET_OLD\n"); git(outside, "add", "-f", ".env"); git(outside, "commit", "-m", "old secret");
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", outside, "dependency");
+    git(repo, "add", "."); git(repo, "commit", "-m", "submodule baseline");
+    const sub = path.join(repo, "dependency");
+    write(sub, ".env", "SYNTHETIC_SUBMODULE_SECRET_NEW\n"); git(sub, "add", "-f", ".env"); git(sub, "commit", "-m", "new secret");
+    git(repo, "add", "dependency"); git(repo, "config", "diff.submodule", "diff");
+    expect(git(repo, "diff", "--cached", "--submodule=diff")).toContain("SYNTHETIC_SUBMODULE_SECRET");
+    const diff = gitDiff(new Workspace(repo), { mode: "staged" });
+    expect(diff.isRepo).toBe(true);
+    expect(diff.diff).not.toContain("SYNTHETIC_SUBMODULE_SECRET"); expect(diff.diff).not.toContain(".env");
+  });
   it("enforces the byte cap even for a single enormous line", async () => {
     write(repo, "long.txt", "x".repeat(300000));
     await expect(new Workspace(repo).readFile("long.txt")).rejects.toThrow(/byte budget/);

@@ -60,6 +60,7 @@ export function makeGitRepo(dir: string): void {
 /** Point the persistent state dir at an isolated temp location. */
 export function isolateStateDir(): string {
   const dir = makeTmpDir("state");
+  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
   process.env.C2C_STATE_DIR = dir;
   return dir;
 }

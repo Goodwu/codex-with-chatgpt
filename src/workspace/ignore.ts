@@ -10,6 +10,8 @@ import path from "node:path";
 export const SENSITIVE_PATTERNS: string[] = [
   ".git",
   ".git/",
+  ".codex",
+  ".codex/",
   ".env",
   ".env.*",
   "!.env.example",
@@ -80,6 +82,7 @@ export class IgnoreRules {
   private noise: Ignore;
   private custom: Ignore;
   private readonly stateRelative: string | null;
+  private readonly rootSensitive: boolean;
 
   constructor(workspaceRoot: string) {
     const state = fs.existsSync(getStateDir()) ? fs.realpathSync.native(getStateDir()) : path.resolve(getStateDir());
@@ -87,6 +90,8 @@ export class IgnoreRules {
     this.stateRelative = !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`)
       ? relative.split(path.sep).join("/") : null;
     this.sensitive = ignore().add(SENSITIVE_PATTERNS);
+    const absolute = workspaceRoot.slice(path.parse(workspaceRoot).root.length).split(path.sep).join("/");
+    this.rootSensitive = absolute !== "" && (this.sensitive.ignores(absolute) || this.sensitive.ignores(`${absolute}/`));
     this.noise = ignore().add(NOISE_PATTERNS);
     this.custom = ignore();
     const c2cignore = path.join(workspaceRoot, ".c2cignore");
@@ -106,6 +111,7 @@ export class IgnoreRules {
 
   /** True when the path must be denied with ACCESS_DENIED_SENSITIVE_FILE. */
   isSensitive(relPath: string): boolean {
+    if (this.rootSensitive) return true;
     if (!relPath || relPath === ".") return false;
     if (this.stateRelative !== null && (this.stateRelative === "" || relPath === this.stateRelative || relPath.startsWith(this.stateRelative + "/"))) return true;
     return this.sensitive.ignores(relPath) || this.custom.ignores(relPath);

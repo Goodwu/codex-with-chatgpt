@@ -172,3 +172,51 @@ reads, root caps, CLI lifecycle refusal, independent Git, subtrees, worktrees,
 submodules and non-execution of repository-defined Git helpers. Browser pairing
 with a real ChatGPT account remains a separate end-to-end check; unit/HTTP tests
 do not claim to complete that user-login flow.
+
+
+## Review fixes: authorization state and recovery
+
+The retained implementation is PR #2 (`feat/secure-multi-root-hardened`). PR #1
+is closed; it supplies reviewed design properties, not a second implementation
+to merge. Both arose from the same task. Commands continue to use `--approve`.
+
+Activation now creates `workspace-roots/<workspaceId>.json.enabled` **before**
+publishing the authorization JSON. The marker is retained after all extras are
+removed. Marker/file contents are synced before publication; POSIX directory
+entries are synced as well. A failed first publication leaves the marker and
+blocks startup rather than silently returning to legacy permissions. An ordinary
+single-root workspace with neither object does not create either on read/preview.
+
+The application state directory and its `workspace-roots` child must be real,
+private, user-owned directories. The marker and JSON must be single-linked regular
+files. On POSIX, group/other access or a different owner is rejected on reads,
+not merely corrected on creation. Reads use a bounded descriptor, no-follow flags
+where supported, and identity/metadata checks after opening and reading. Windows
+retains the upstream per-user application-directory ACL assumption; Node mode
+bits do not verify ACLs. Directory fsync is not performed on Windows.
+
+| Situation | Safe response |
+| --- | --- |
+| One or several extra directories are offline/replaced | `roots list`, then `roots remove <alias>` for each unwanted root. Removal preserves the other saved identities; it does not re-pin them. Restore or remove all unavailable roots before `setup` and re-pairing. |
+| `ROOT_STATE_MISSING` | Stop. The marker exists but the grants do not. Restore verified local state; never remove the marker to make startup succeed. |
+| `ROOT_MARKER_MISSING` | Stop. A JSON without its marker is not automatically adopted, including manifests made by pre-review development builds. Preserve it for local inspection; do not synthesize a marker or downgrade. |
+| `UNSAFE_ROOT_STATE` | Stop and inspect ownership, permissions, links and integrity locally. Do not automatically chmod/chown or follow another state directory. |
+| Interrupted first activation, no verified state to restore | Preserve the evidence, keep this workspace disconnected, and have the trusted local operator explicitly reconfigure and revoke its old authorization. This is not a browser reconnect error. |
+
+There is no automatic import of either candidate's pre-review development state.
+This does not migrate or overwrite PR #1's `root-grants` data. Do not point two
+implementations at the same state directory or delete all state to defeat a
+failure. Loss/rollback of the entire application state is outside the marker's
+protection and the trusted-local-executor threat model.
+
+`.codex` and its descendants are now denied by the same built-in policy used by
+file, directory, search, image and Git tools. Custom ignore negations cannot
+allow them. Explicit root approval, aliases or selecting a sensitive directory
+as main cannot strip this protection. This is intentionally conservative: keep
+code to be reviewed outside credential directories (including `.codex` subtrees).
+
+A pure removal does not require surviving extra directories to be online, but it
+must keep the primary identity and all retained grants unchanged. Additions still
+require approval and live identity checks; concurrent edits still use the expected
+version and an exclusive lock. A remaining offline root blocks runtime reads and
+startup even when the CLI has successfully removed a different root.

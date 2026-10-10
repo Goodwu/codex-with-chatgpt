@@ -173,6 +173,11 @@ connector after a root change; preserve the Project and chats. The bridge stays
 read-only, each root keeps its own deny rules and Git review, and old tokens do
 not silently gain access. See [multi-root usage and security](docs/multi-root.md).
 
+Missing/corrupt authorization state fails closed; never delete it to reconnect.
+Multiple offline roots can be revoked one at a time before re-pairing. `.codex`
+and its descendants cannot be exposed, even with explicit root approval.
+Use only the retained PR #2 branch; PR #1 is an archived review source.
+
 ## How it works
 
 ```

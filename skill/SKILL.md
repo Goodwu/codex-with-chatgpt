@@ -242,6 +242,19 @@ working directory so review can correlate tests with the correct repository.
 Codex's own write/sandbox permissions remain separate and require their normal
 user authorization. The ChatGPT connector is read-only for every root.
 
+For `ROOT_STATE_MISSING`, `ROOT_MARKER_MISSING` or `UNSAFE_ROOT_STATE`, stop
+before browser reconnect. Preserve the authorization JSON and activation marker;
+never delete/synthesize them, silently chmod/chown, or downgrade the program to
+make startup succeed. Read `<checkout>/docs/multi-root.md` recovery first. An
+unmarked pre-review development manifest is not automatically imported. Recovery
+without verified state requires explicit local operator approval, not a guessed
+manifest or another ChatGPT Project. `.codex` and its subtree are never approved.
+
+When several extra roots are unavailable, list and remove the requested aliases
+one at a time. A successful removal can leave other offline roots in the list;
+do not undo it or create another workspace. Restore/remove all unavailable roots
+before setup and re-pairing. The primary identity and retained pins do not change.
+
 A missing/replaced root or corrupt grant must fail closed. An offline extra root
 can be removed locally when the user requests it; never silently discard a root
 or downgrade the grant. See `<checkout>/docs/multi-root.md` for recovery and

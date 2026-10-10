@@ -85,3 +85,24 @@ fsmonitor and hooks are disabled, as are inherited Git configuration overrides
 and recursive submodule inspection. No claim is made to sandbox a malicious
 same-user OS process, compromised Git executable, or arbitrary filesystem races.
 The trusted local executor and application state remain part of the trust base.
+
+
+### Authorization storage review corrections
+
+PR #2 incorporates PR #1's fail-closed storage properties without replacing the
+retained Git/file boundaries. A durable activation marker precedes manifest
+publication; missing JSON after activation, missing/bad markers, insecure POSIX
+ownership/modes, hard-linked files and symlinked managed parents are rejected.
+Descriptor identity and bounded reads are checked at open and completion. No
+remote tool can repair or delete these objects. Files are fsynced before rename;
+POSIX directories are synced, while Windows still relies on private account ACLs
+and does not perform directory fsync. Ancestors above the application state root
+remain part of the trusted OS/account environment; this is not an openat-style
+sandbox against a hostile same-user process or rollback of the entire state.
+
+Offline recovery can remove unchanged entries without resolving other extra
+roots. It cannot replace/re-pin a retained root or bypass approval using a caller
+flag. Runtime validation remains strict for every retained identity. `.codex`
+and its subtree are part of the non-negatable built-in sensitive policy, including
+when a directory itself is used as a root. See [recovery](multi-root.md#review-fixes-authorization-state-and-recovery)
+for errors and pre-review development-state compatibility limits.

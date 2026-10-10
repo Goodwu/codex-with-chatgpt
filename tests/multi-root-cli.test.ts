@@ -38,6 +38,21 @@ describe("c2c roots CLI", () => {
     expect(cli("list").data.roots).toHaveLength(2);
     expect(cli("remove", "dep").status).toBe(0);
   });
+  it("reports success while revoking multiple offline roots one at a time", () => {
+    const second = makeTmpDir("root-cli-second");
+    try {
+      expect(cli("add", "dep", dep, "--approve").status).toBe(0);
+      expect(cli("add", "second", second, "--approve").status).toBe(0);
+      cleanup(dep); cleanup(second);
+      const first = cli("remove", "dep");
+      expect(first.status).toBe(0); expect(first.data.rePairRequired).toBe(true);
+      expect(first.data.roots.map((r: { name: string }) => r.name)).toEqual(["main", "second"]);
+      expect(() => new WorkspaceRoots(new Workspace(main))).toThrow(/unavailable/);
+      const last = cli("remove", "second");
+      expect(last.status).toBe(0); expect(last.data.rePairRequired).toBe(true);
+      expect(new WorkspaceRoots(new Workspace(main)).approved).toHaveLength(1);
+    } finally { cleanup(second); }
+  }, 30_000);
   it("does not start an uncertain bridge or mutate its root configuration", () => {
     const ws = new Workspace(main);
     fs.mkdirSync(path.join(state, "runtime"), { recursive: true });

@@ -71,6 +71,18 @@ describe("local root authorization", () => {
   it.each(["main", "../dep", "/tmp", "Dep", "a/b", "a\\b", "", "x".repeat(33)])("rejects invalid/reserved alias %j", name => {
     expect(() => prepareRootAddition(ws, name, dep)).toThrow();
   });
+  it("refuses .codex and its descendants as roots, including canonical symlink targets", () => {
+    const secret = write(other, ".codex/nested/auth.json", "SYNTHETIC_CODEX_CREDENTIAL\n");
+    for (const dir of [path.join(other, ".codex"), path.dirname(secret)]) {
+      expect(() => prepareRootAddition(ws, "private", dir)).toThrow(/sensitive/);
+    }
+    const alias = path.join(other, "ordinary-alias");
+    if (symlink(path.join(other, ".codex"), alias, true)) {
+      expect(() => prepareRootAddition(ws, "private", alias)).toThrow(/sensitive/);
+    }
+    expect(() => new WorkspaceRoots(new Workspace(path.join(other, ".codex")))).toThrow(/sensitive/);
+    expect(fs.existsSync(rootsFile(ws.id))).toBe(false);
+  });
   it("enforces the root count cap without mutating an existing grant", () => {
     const dirs: string[] = [];
     try {
@@ -193,6 +205,38 @@ describe("multi-root MCP and OAuth", () => {
     expect(diff.diff).toContain("example needle"); expect(diff.diff).not.toMatch(/secret needle|private needle/);
     const status = body(await client.callTool({ name: "git_status", arguments: { root: "dep" } }));
     expect(status.hidden.changes).toBeGreaterThan(0); expect(JSON.stringify(status.staged)).not.toContain("private.txt");
+  });
+  it("enforces .codex subtree protection across file/list/search/git despite custom negations", async () => {
+    makeGitRepo(dep);
+    write(dep, ".codex/auth.json", "SYNTHETIC_CODEX_CREDENTIAL needle\n");
+    write(dep, "nested/.codex/auth.json", "SYNTHETIC_CODEX_CREDENTIAL needle\n");
+    write(dep, ".c2cignore", "!.codex/\n!.codex/**\n!nested/.codex/**\n");
+    write(dep, "visible.txt", "public needle\n"); git(dep, "add", "-f", ".");
+    expect(git(dep, "diff", "--cached")).toContain("SYNTHETIC_CODEX_CREDENTIAL");
+    add(); const client = await connect();
+    for (const file of [".codex/auth.json", "nested/.codex/auth.json"]) {
+      const result = await client.callTool({ name: "read_file", arguments: { root: "dep", path: file } });
+      expect(result.isError).toBe(true); expect(body(result).error).toBe("ACCESS_DENIED_SENSITIVE_FILE");
+      expect(JSON.stringify(result)).not.toContain("SYNTHETIC_CODEX_CREDENTIAL");
+    }
+    const listing = body(await client.callTool({ name: "list_directory", arguments: { root: "dep" } }));
+    expect(listing.entries.some((entry: { path: string }) => entry.path === ".codex/")).toBe(false);
+    const search = await client.callTool({ name: "search_workspace", arguments: { root: "dep", query: "needle" } });
+    const diff = await client.callTool({ name: "git_diff", arguments: { root: "dep", mode: "staged" } });
+    const status = body(await client.callTool({ name: "git_status", arguments: { root: "dep" } }));
+    expect(JSON.stringify(search)).toContain("public needle");
+    expect(JSON.stringify(diff)).toContain("public needle");
+    expect(JSON.stringify([search, diff, status])).not.toMatch(/SYNTHETIC_CODEX_CREDENTIAL|\.codex\/auth\.json/);
+    expect(status.hidden.changes).toBeGreaterThanOrEqual(2);
+  });
+  it("rejects HTTP access and restart when an activated manifest is lost", async () => {
+    add(); await connect();
+    const old = bridge!.authStore.issueTokens({ clientId: "old", scopes: allScopes });
+    fs.unlinkSync(rootsFile(ws.id));
+    expect((await fetch(`${bridge!.localBaseUrl()}/mcp`, { method: "POST", headers: { authorization: `Bearer ${old.accessToken}`, "content-type": "application/json" }, body: "{}" })).status).toBe(503);
+    expect((await fetch(`${bridge!.localBaseUrl()}/oauth/token`, { method: "POST", body: new URLSearchParams({ grant_type: "refresh_token", client_id: "old", refresh_token: old.refreshToken! }) })).status).toBe(503);
+    await bridge!.close(); bridge = undefined;
+    await expect(startBridge({ workspaceRoot: main, port: 0, persistRuntime: false })).rejects.toMatchObject({ code: "ROOT_STATE_MISSING" });
   });
   it("reads images from the selected root and does not bypass scopes", async () => {
     fs.writeFileSync(path.join(dep, "pixel.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]));

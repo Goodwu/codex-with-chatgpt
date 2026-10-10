@@ -2,21 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
-import { ensureDir, getStateDir } from "../config/paths.js";
+import { getStateDir } from "../config/paths.js";
 import { Workspace } from "./manager.js";
 import ignore from "ignore";
 import { SENSITIVE_PATTERNS } from "./ignore.js";
+import { RootError, readRootState, withRootStateLock, writeRootState } from "./root-state.js";
+export { RootError, rootsFile, rootsMarkerFile } from "./root-state.js";
 
 export const MAX_WORKSPACE_ROOTS = 16;
-const MAX_CONFIG_BYTES = 64 * 1024;
 const ALIAS = /^[a-z][a-z0-9_-]{0,31}$/;
-
-export class RootError extends Error {
-  constructor(readonly code: string, message: string) {
-    super(message);
-    this.name = "RootError";
-  }
-}
 
 /** Local-only authorization data. Never load root grants from repository files. */
 export interface ApprovedRoot {
@@ -39,10 +33,6 @@ export interface RootChange {
   config: RootConfig;
   changed: boolean;
   expandsAccess: boolean;
-}
-
-export function rootsFile(workspaceId: string): string {
-  return path.join(getStateDir(), "workspace-roots", `${workspaceId}.json`);
 }
 
 function within(root: string, candidate: string): boolean {
@@ -110,15 +100,11 @@ function validateConfig(value: unknown, workspace: Workspace): RootConfig {
 }
 
 function readConfig(workspace: Workspace): RootConfig | null {
-  const file = rootsFile(workspace.id);
-  let stat: fs.Stats;
-  try { stat = fs.lstatSync(file); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    return invalidConfig();
-  }
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_CONFIG_BYTES) return invalidConfig();
-  try { return validateConfig(JSON.parse(fs.readFileSync(file, "utf8")), workspace); }
-  catch { return invalidConfig(); }
+  const content = readRootState(workspace.id);
+  if (content === null) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(content); } catch { return invalidConfig(); }
+  return validateConfig(parsed, workspace);
 }
 
 /** Local CLI metadata; removal must not require access to an offline directory. */
@@ -136,7 +122,11 @@ export class WorkspaceRoots {
     const config = readConfig(primary);
     this.authorizationVersion = versionOf(config);
     this.approved = config?.roots ?? [pin("main", primary.root)];
-    for (const root of this.approved) assertPinned(root);
+    for (const root of this.approved) {
+      // Preserve legacy layouts (e.g. state nested in main and separately denied).
+      if (this.authorizationVersion) assertSafeAddition(root); else assertNotSensitiveRoot(root);
+      assertPinned(root);
+    }
     this.workspaces.set("main", primary);
   }
 
@@ -144,7 +134,11 @@ export class WorkspaceRoots {
     if (versionOf(readConfig(this.primary)) !== this.authorizationVersion) {
       throw new RootError("ROOTS_CHANGED", "Root authorization changed. Restart the bridge and pair again.");
     }
-    for (const root of this.approved) assertPinned(root);
+    for (const root of this.approved) {
+      // Preserve legacy layouts (e.g. state nested in main and separately denied).
+      if (this.authorizationVersion) assertSafeAddition(root); else assertNotSensitiveRoot(root);
+      assertPinned(root);
+    }
   }
 
   select(name = "main"): Workspace {
@@ -166,7 +160,11 @@ function assertSafeAddition(root: ApprovedRoot): void {
   if (root.path === path.parse(root.path).root || root.path === home || overlap(root.path, state)) {
     throw new RootError("UNSAFE_ROOT", "Do not authorize the filesystem root, home directory, or a directory overlapping C2C state.");
   }
-  // A root named .ssh (or placed inside it) must not evade root-relative deny rules.
+  assertNotSensitiveRoot(root);
+}
+
+function assertNotSensitiveRoot(root: ApprovedRoot): void {
+  // A root named .ssh/.codex (or inside it) must not evade root-relative deny rules.
   const rel = path.relative(path.parse(root.path).root, root.path).split(path.sep).join("/");
   if (ignore().add(SENSITIVE_PATTERNS).ignores(rel) || ignore().add(SENSITIVE_PATTERNS).ignores(`${rel}/`)) {
     throw new RootError("UNSAFE_ROOT", "A root inside a sensitive directory cannot be authorized.");
@@ -179,7 +177,7 @@ export function prepareRootAddition(workspace: Workspace, name: string, input: s
   }
   const before = readConfig(workspace);
   const roots = before?.roots ?? [pin("main", workspace.root)];
-  for (const root of roots) assertPinned(root);
+  for (const root of roots) { assertSafeAddition(root); assertPinned(root); }
   const addition = pin(name, input);
   assertSafeAddition(addition);
   const existing = roots.find(root => root.name === name);
@@ -202,7 +200,7 @@ export function prepareRootRemoval(workspace: Workspace, name: string): RootChan
   if (!before?.roots.some(root => root.name === name)) throw new RootError("UNKNOWN_ROOT", `Unknown root '${name}'.`);
   // Do not stat the removed directory: an offline/deleted root must remain removable.
   const roots = before.roots.filter(root => root.name !== name);
-  for (const root of roots) assertPinned(root);
+  assertPinned(roots[0]);
   return {
     workspace, expectedVersion: versionOf(before), changed: true, expandsAccess: false,
     config: { ...before, revision: randomBytes(16).toString("hex"), roots },
@@ -213,24 +211,26 @@ export function prepareRootRemoval(workspace: Workspace, name: string): RootChan
 export function commitRootChange(change: RootChange, approved = false): void {
   if (!change.changed) return;
   if (change.expandsAccess && !approved) throw new RootError("ROOT_APPROVAL_REQUIRED", "Review the canonical directory and repeat with --approve to authorize read access.");
-  const file = rootsFile(change.workspace.id);
-  ensureDir(path.dirname(file));
-  const lock = `${file}.lock`;
-  let fd: number;
-  try { fd = fs.openSync(lock, "wx", 0o600); }
-  catch { throw new RootError("ROOT_UPDATE_BUSY", "Another root update is active. No changes were made."); }
-  const tmp = `${file}.${randomBytes(8).toString("hex")}.tmp`;
-  try {
-    if (versionOf(readConfig(change.workspace)) !== change.expectedVersion) {
+  withRootStateLock(change.workspace.id, () => {
+    const before = readConfig(change.workspace);
+    if (versionOf(before) !== change.expectedVersion) {
       throw new RootError("ROOTS_CHANGED", "Another update changed the root list. Review it and retry.");
     }
-    validateConfig(change.config, change.workspace);
-    for (const root of change.config.roots) assertPinned(root);
-    fs.writeFileSync(tmp, JSON.stringify(change.config, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-    fs.renameSync(tmp, file);
-  } finally {
-    fs.closeSync(fd);
-    fs.rmSync(tmp, { force: true });
-    fs.rmSync(lock, { force: true });
-  }
+    const next = validateConfig(change.config, change.workspace);
+    if (before?.revision === next.revision) {
+      throw new RootError("ROOTS_CHANGED", "A root update requires a fresh authorization revision.");
+    }
+    // Recovery may ONLY remove unchanged entries. Never trust a caller's
+    // expandsAccess flag to skip identity/approval checks for a replacement.
+    const removalOnly = before !== null && next.roots.length < before.roots.length &&
+      next.roots.every(root => before.roots.some(old => JSON.stringify(root) === JSON.stringify(old)));
+    assertPinned(next.roots[0]);
+    if (!removalOnly) {
+      if (!approved) throw new RootError("ROOT_APPROVAL_REQUIRED", "Directory additions or replacements require --approve.");
+      for (const root of next.roots) { assertSafeAddition(root); assertPinned(root); }
+    }
+    // Unavailable retained roots remain pinned to their OLD identities. Runtime
+    // checks still refuse all reads until they are restored or also revoked.
+    writeRootState(change.workspace.id, JSON.stringify(next, null, 2) + "\n");
+  });
 }

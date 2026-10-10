@@ -1,7 +1,7 @@
 import type { Command } from "commander";
 import path from "node:path";
 import { Workspace } from "../workspace/manager.js";
-import { WorkspaceRoots, listApprovedRoots, RootError, prepareRootAddition, prepareRootRemoval, commitRootChange, type RootChange } from "../workspace/roots.js";
+import { listApprovedRoots, RootError, prepareRootAddition, prepareRootRemoval, commitRootChange, type RootChange } from "../workspace/roots.js";
 import { findBridgeObservation } from "../bridge/runtime.js";
 import { adminFetch } from "../process/daemon.js";
 import { AuthStore } from "../auth/store.js";
@@ -48,9 +48,9 @@ async function apply(change: RootChange, opts: Options): Promise<void> {
     new AuthStore(change.workspace.id).revokeAll();
   }
   const data = { ok: true, changed: change.changed, workspaceId: change.workspace.id,
-    roots: new WorkspaceRoots(change.workspace).approved.map(root => ({ name: root.name, path: root.path })),
+    roots: listApprovedRoots(change.workspace).map(root => ({ name: root.name, path: root.path })),
     rePairRequired: change.changed,
-    nextStep: change.changed ? "Run c2c setup for this main workspace and authorize its existing connector again. Keep the Project and saved conversations." : null };
+    nextStep: change.changed ? "Restore or remove any remaining unavailable roots, then run c2c setup for this main workspace and authorize its existing connector again. Keep the Project and saved conversations." : null };
   if (opts.json) print(data);
   else process.stdout.write(data.roots.map(root => `${root.name}\t${root.path}`).join("\n") + "\n" + (data.nextStep ? data.nextStep + "\n" : ""));
 }
