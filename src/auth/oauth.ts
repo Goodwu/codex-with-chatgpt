@@ -10,6 +10,7 @@ export interface OAuthDeps {
   store: AuthStore;
   pairing: PairingManager;
   workspaceName: string;
+  rootNames?: readonly string[];
   getBaseUrl: (req: Request) => string;
   logger: Logger;
 }
@@ -68,6 +69,7 @@ function protectedResourceMetadata(base: string): Record<string, unknown> {
 function pairingPage(opts: {
   requestId: string;
   workspaceName: string;
+  rootNames?: readonly string[];
   scopes: string[];
   error?: string;
 }): string {
@@ -81,6 +83,7 @@ function pairingPage(opts: {
   const scopeList = opts.scopes
     .map((scope) => `<li>${escapeHtml(scopeLabels[scope] ?? scope)}</li>`)
     .join("");
+  const rootList = (opts.rootNames ?? ["main"]).map(name => `<li>${escapeHtml(name)}</li>`).join("");
   const errorHtml = opts.error
     ? `<p class="error" role="alert">${escapeHtml(opts.error)}</p>`
     : "";
@@ -121,6 +124,8 @@ function pairingPage(opts: {
   <h1>${escapedProductName}</h1>
   <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (read-only):</p>
   <ul>${scopeList}</ul>
+  <p>Approved directory names (read-only):</p>
+  <ul>${rootList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">
     <input type="text" name="pairing_code" id="pairing_code" placeholder="XXXX-XXXX"
@@ -237,7 +242,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     res
       .status(200)
       .type("html")
-      .send(pairingPage({ requestId: request.id, workspaceName: deps.workspaceName, scopes }));
+      .send(pairingPage({ requestId: request.id, workspaceName: deps.workspaceName, rootNames: deps.rootNames, scopes }));
   });
 
   router.post("/oauth/authorize", urlencoded({ extended: false }), (req, res) => {
@@ -267,6 +272,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
           pairingPage({
             requestId: request.id,
             workspaceName: deps.workspaceName,
+            rootNames: deps.rootNames,
             scopes: request.scopes,
             error: messages[verdict.reason] ?? "Verification failed.",
           })

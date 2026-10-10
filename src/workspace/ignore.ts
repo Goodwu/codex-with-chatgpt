@@ -1,3 +1,4 @@
+import { getStateDir } from "../config/paths.js";
 import ignore, { type Ignore } from "ignore";
 import fs from "node:fs";
 import path from "node:path";
@@ -7,6 +8,10 @@ import path from "node:path";
  * Matched with gitignore semantics against workspace-relative paths.
  */
 export const SENSITIVE_PATTERNS: string[] = [
+  ".git",
+  ".git/",
+  ".codex",
+  ".codex/",
   ".env",
   ".env.*",
   "!.env.example",
@@ -76,24 +81,39 @@ export class IgnoreRules {
   private sensitive: Ignore;
   private noise: Ignore;
   private custom: Ignore;
+  private readonly stateRelative: string | null;
+  private readonly rootSensitive: boolean;
 
   constructor(workspaceRoot: string) {
+    const state = fs.existsSync(getStateDir()) ? fs.realpathSync.native(getStateDir()) : path.resolve(getStateDir());
+    const relative = path.relative(workspaceRoot, state);
+    this.stateRelative = !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`)
+      ? relative.split(path.sep).join("/") : null;
     this.sensitive = ignore().add(SENSITIVE_PATTERNS);
+    const absolute = workspaceRoot.slice(path.parse(workspaceRoot).root.length).split(path.sep).join("/");
+    this.rootSensitive = absolute !== "" && (this.sensitive.ignores(absolute) || this.sensitive.ignores(`${absolute}/`));
     this.noise = ignore().add(NOISE_PATTERNS);
     this.custom = ignore();
     const c2cignore = path.join(workspaceRoot, ".c2cignore");
     try {
-      if (fs.existsSync(c2cignore)) {
-        this.custom.add(fs.readFileSync(c2cignore, "utf8"));
+      const info = fs.lstatSync(c2cignore);
+      const real = fs.realpathSync.native(c2cignore);
+      const rel = path.relative(workspaceRoot, real);
+      if (!info.isFile() || info.isSymbolicLink() || path.isAbsolute(rel) || rel === ".." ||
+          rel.startsWith(`..${path.sep}`) || info.size > 64 * 1024) {
+        throw new Error("Invalid .c2cignore: policy must be a regular, bounded file inside its root.");
       }
-    } catch {
-      // unreadable .c2cignore: fall back to defaults only
+      this.custom.add(fs.readFileSync(real, "utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
 
   /** True when the path must be denied with ACCESS_DENIED_SENSITIVE_FILE. */
   isSensitive(relPath: string): boolean {
+    if (this.rootSensitive) return true;
     if (!relPath || relPath === ".") return false;
+    if (this.stateRelative !== null && (this.stateRelative === "" || relPath === this.stateRelative || relPath.startsWith(this.stateRelative + "/"))) return true;
     return this.sensitive.ignores(relPath) || this.custom.ignores(relPath);
   }
 

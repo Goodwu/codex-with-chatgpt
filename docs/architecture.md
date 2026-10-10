@@ -34,7 +34,8 @@
 - **Computer Use = control plane**: tiny `[C2C]` state messages (< 1 KB).
 - **MCP = data plane**: ChatGPT pulls files/diffs/search results itself.
 - **Read-only by design**: no write/exec tools exist in V1 at all.
-- **Workspace is the security boundary**: one bridge = one workspace = one token audience.
+- **Workspace is the security boundary**: one bridge = one logical workspace = one token audience.
+  Explicitly approved roots have independent path boundaries and a versioned grant.
 
 ## Components (src/)
 
@@ -78,3 +79,22 @@ user step. Tunnel name, hostname and preference live under the OS state dir
 provisioning fails, C2C falls back to Quick Tunnel. If a named tunnel later
 drops, doctor asks for a Cloudflare re-login (`namedRepair`) instead of
 rotating the ChatGPT connector.
+
+## Multi-root dispatch
+
+`WorkspaceRoots` wraps the existing primary `Workspace`, retaining its identity
+for runtime, OAuth clients, sessions, tunnel choice and execution records. A
+local manifest supplies named canonical roots and directory identity pins.
+`c2c roots` is the only management interface; MCP exposes no mutation API.
+
+Six file/search/Git tools accept `root` (default `main`) and dispatch to a
+separate cached `Workspace` for that alias. Results carry the alias. Git state
+and diffs are not merged across repositories. `workspace_info` lists approved
+aliases; execution tools still use the primary workspace ID.
+
+The Bridge fixes a root manifest snapshot at startup. Authorization stores bind
+its digest to tokens; HTTP guards reject changed grants and tool completion
+checks prevent asynchronous reads from releasing results after a grant change.
+Local root updates stop the verified Bridge, atomically replace the manifest
+and revoke authorization. The same connector/Project can be reauthorized; it is
+not replaced by one connector per root. See [multi-root](multi-root.md).

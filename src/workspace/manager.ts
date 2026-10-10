@@ -1,9 +1,9 @@
+import { readJsonIfExists } from "../config/paths.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import readline from "node:readline";
 import { IgnoreRules } from "./ignore.js";
-import { readJsonIfExists } from "../config/paths.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
@@ -102,14 +102,23 @@ export class Workspace {
     this.root = real;
     this.id = createHash("sha256").update(normCase(real)).digest("hex").slice(0, 12);
     this.ignoreRules = new IgnoreRules(real);
-    this.projectConfig = parseProjectConfig(readJsonIfExists<unknown>(path.join(real, ".c2c.json")));
+    this.projectConfig = parseProjectConfig(this.readProjectJson(".c2c.json"));
     this.name = this.projectConfig.name ?? path.basename(real);
   }
 
   private contains(candidate: string): boolean {
-    const r = normCase(this.root);
-    const c = normCase(candidate);
-    return c === r || c.startsWith(r + path.sep);
+    // Canonical paths must be contained even on case-sensitive macOS volumes.
+    const rel = path.relative(this.root, candidate);
+    return rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`));
+  }
+
+  private readProjectJson(file: string): unknown {
+    try {
+      const { abs } = this.resolve(file);
+      const stat = fs.statSync(abs);
+      if (!stat.isFile() || stat.size > DEFAULT_MAX_BYTES) return null;
+      return readJsonIfExists<unknown>(abs);
+    } catch { return null; }
   }
 
   /**
@@ -149,6 +158,10 @@ export class Workspace {
     if (p === "") p = ".";
 
     const abs = path.resolve(this.root, p);
+    if (!this.contains(abs) || (process.platform !== "win32" && path.win32.isAbsolute(p) && !path.isAbsolute(p))) {
+      throw new WorkspaceError("PATH_OUTSIDE_WORKSPACE", "Path is outside the selected root.");
+    }
+    const lexicalRel = path.relative(this.root, abs).split(path.sep).join("/");
     const canonical = this.canonicalize(abs);
     if (!this.contains(canonical)) {
       throw new WorkspaceError(
@@ -160,7 +173,8 @@ export class Workspace {
     if (rel.startsWith("..")) {
       throw new WorkspaceError("PATH_OUTSIDE_WORKSPACE", `Path resolves outside the connected workspace: ${requested}`);
     }
-    if (!opts.allowSensitive && rel !== "" && this.ignoreRules.isSensitive(rel)) {
+    if (!opts.allowSensitive && [rel, lexicalRel].some(p => p !== "" &&
+        (this.ignoreRules.isSensitive(p) || this.ignoreRules.isSensitive(p + "/")))) {
       throw new WorkspaceError(
         "ACCESS_DENIED_SENSITIVE_FILE",
         `ACCESS_DENIED_SENSITIVE_FILE: '${rel}' matches the sensitive-file policy and cannot be read.`
@@ -220,7 +234,10 @@ export class Workspace {
       totalLines++;
       if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
         const cost = Buffer.byteLength(line, "utf8") + 1;
-        if (collectedBytes + cost > maxBytes && lines.length > 0) {
+        if (cost > maxBytes && lines.length === 0) {
+          throw new WorkspaceError("FILE_TOO_LARGE", "A single line exceeds the response byte budget.");
+        }
+        if (collectedBytes + cost > maxBytes) {
           byteTruncated = true;
         } else {
           lines.push(line);
@@ -279,13 +296,15 @@ export class Workspace {
       for (const entry of entries) {
         const childRel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
         if (this.ignoreRules.isHidden(childRel) || this.ignoreRules.isHidden(childRel + "/")) continue;
+        let childAbs: string;
+        try { childAbs = this.resolve(childRel).abs; } catch { continue; }
         if (entry.isDirectory()) {
           all.push({ path: childRel + "/", type: "dir" });
-          if (level < depth) await walk(path.join(dirAbs, entry.name), childRel, level + 1);
+          if (level < depth) await walk(childAbs, childRel, level + 1);
         } else if (entry.isFile()) {
           let size: number | undefined;
           try {
-            size = (await fs.promises.stat(path.join(dirAbs, entry.name))).size;
+            size = (await fs.promises.stat(childAbs)).size;
           } catch {
             size = undefined;
           }
@@ -315,7 +334,9 @@ export class Workspace {
     packageManager: string | null;
     scripts: Record<string, string>;
   } {
-    const has = (f: string): boolean => fs.existsSync(path.join(this.root, f));
+    const has = (f: string): boolean => {
+      try { return fs.existsSync(this.resolve(f).abs); } catch { return false; }
+    };
     const languages = new Set<string>();
     const frameworks = new Set<string>();
     let projectType = "unknown";
@@ -325,7 +346,7 @@ export class Workspace {
     if (has("package.json")) {
       projectType = "node";
       languages.add("JavaScript");
-      const rawPackage = readJsonIfExists<unknown>(path.join(this.root, "package.json"));
+      const rawPackage = this.readProjectJson("package.json");
       const pkg = rawPackage && typeof rawPackage === "object" && !Array.isArray(rawPackage)
         ? rawPackage as Record<string, unknown>
         : {};
